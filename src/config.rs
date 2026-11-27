@@ -155,6 +155,22 @@ pub struct CharacterConfig {
     pub idle_lines: Vec<String>,
     pub pat_lines: Vec<String>,
     pub pat_line_gap: f64,
+    #[serde(rename = "sp_alarm_before")]
+    pub sp_alarm_before: Vec<String>,
+    #[serde(rename = "sp_alarm_after")]
+    pub sp_alarm_after: Vec<String>,
+    #[serde(rename = "sp_pill_before")]
+    pub sp_pill_before: Vec<String>,
+    #[serde(rename = "sp_pill_after")]
+    pub sp_pill_after: Vec<String>,
+    #[serde(rename = "sp_water_before")]
+    pub sp_water_before: Vec<String>,
+    #[serde(rename = "sp_water_after")]
+    pub sp_water_after: Vec<String>,
+    #[serde(rename = "sp_todo_before")]
+    pub sp_todo_before: Vec<String>,
+    #[serde(rename = "sp_todo_after")]
+    pub sp_todo_after: Vec<String>,
     pub sound_type: String,
     pub sound_pitch: f64,
     pub sound_file: String,
@@ -224,6 +240,34 @@ pub struct CharacterConfig {
     pub sound_idle: bool,
     pub head_back: bool,
     pub head_back_sh: bool,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl CharacterConfig {
+    /// Returns raw lines for a standard `sp_*` pool or custom group pool (`sp_g1_before`, etc.).
+    pub fn special_lines_for_key(&self, key: &str) -> Vec<String> {
+        match key {
+            "sp_alarm_before" => self.sp_alarm_before.clone(),
+            "sp_alarm_after" => self.sp_alarm_after.clone(),
+            "sp_pill_before" => self.sp_pill_before.clone(),
+            "sp_pill_after" => self.sp_pill_after.clone(),
+            "sp_water_before" => self.sp_water_before.clone(),
+            "sp_water_after" => self.sp_water_after.clone(),
+            "sp_todo_before" => self.sp_todo_before.clone(),
+            "sp_todo_after" => self.sp_todo_after.clone(),
+            _ => self
+                .extra
+                .get(key)
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
 }
 
 impl Default for CharacterConfig {
@@ -267,6 +311,14 @@ impl Default for CharacterConfig {
             idle_lines: Vec::new(),
             pat_lines: Vec::new(),
             pat_line_gap: 8.0,
+            sp_alarm_before: Vec::new(),
+            sp_alarm_after: Vec::new(),
+            sp_pill_before: Vec::new(),
+            sp_pill_after: Vec::new(),
+            sp_water_before: Vec::new(),
+            sp_water_after: Vec::new(),
+            sp_todo_before: Vec::new(),
+            sp_todo_after: Vec::new(),
             sound_type: "click".to_string(),
             sound_pitch: 0.0,
             sound_file: String::new(),
@@ -334,6 +386,7 @@ impl Default for CharacterConfig {
             sound_idle: false,
             head_back: false,
             head_back_sh: true,
+            extra: HashMap::new(),
         }
     }
 }

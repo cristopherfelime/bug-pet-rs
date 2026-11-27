@@ -76,6 +76,7 @@ pub enum PetQuickAction {
 pub struct GlobalMenuState<'a> {
     pub characters: &'a [String],
     pub pets: &'a [PetMenuSnapshot],
+    pub pets_disabled: bool,
     pub ghost: bool,
     pub launch_at_login: bool,
     pub react: &'a crate::config::ReactPrefs,
@@ -85,6 +86,7 @@ pub struct GlobalMenuState<'a> {
 /// Action chosen from the tray context menu.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TrayAction {
+    TogglePetsDisabled,
     SpawnCharacter(String),
     GatherAll,
     ToggleGhost,
@@ -118,6 +120,7 @@ impl TrayIcon {
         hwnd: HWND,
         data_dir: Option<&Path>,
         pet_count: usize,
+        paused: bool,
         lang: &str,
     ) -> Result<Self, String> {
         let (w, h, rgba) = load_tray_rgba(data_dir);
@@ -132,7 +135,7 @@ impl TrayIcon {
             hIcon: hicon,
             ..Default::default()
         };
-        write_tip(&mut nid.szTip, &format_tooltip(pet_count, lang));
+        write_tip(&mut nid.szTip, &format_tooltip(pet_count, paused, lang));
 
         let ok = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) }.as_bool();
         if !ok {
@@ -151,7 +154,7 @@ impl TrayIcon {
         })
     }
 
-    pub fn update_count(&self, pet_count: usize, lang: &str) {
+    pub fn update_count(&self, pet_count: usize, paused: bool, lang: &str) {
         if !self.added {
             return;
         }
@@ -162,7 +165,7 @@ impl TrayIcon {
             uFlags: NIF_TIP,
             ..Default::default()
         };
-        write_tip(&mut nid.szTip, &format_tooltip(pet_count, lang));
+        write_tip(&mut nid.szTip, &format_tooltip(pet_count, paused, lang));
         unsafe {
             let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
         }
@@ -200,8 +203,15 @@ impl Drop for TrayIcon {
     }
 }
 
-pub fn format_tooltip(pet_count: usize, lang: &str) -> String {
-    if lang.trim().to_ascii_lowercase().starts_with("ko") {
+pub fn format_tooltip(pet_count: usize, paused: bool, lang: &str) -> String {
+    let is_ko = lang.trim().to_ascii_lowercase().starts_with("ko");
+    if paused {
+        if is_ko {
+            format!("BUG Clicker RS · 일시 중지 ({pet_count}명)")
+        } else {
+            format!("BUG Clicker RS · Paused ({pet_count})")
+        }
+    } else if is_ko {
         format!("BUG Clicker RS · {pet_count}명")
     } else {
         format!("BUG Clicker RS · {pet_count}")
@@ -410,6 +420,7 @@ pub fn rgba_to_hicon(width: u32, height: u32, rgba: &[u8]) -> Result<HICON, Stri
 
 /// Localized menu strings (`en`, `ko`, `ja`, `zh`). Templates use `{n}` as a number placeholder.
 pub struct MenuLabels {
+    pets_disabled: &'static str,
     spawn_char: &'static str,
     none: &'static str,
     pet_quick: &'static str,
@@ -485,6 +496,12 @@ pub fn menu_labels(lang: &str) -> MenuLabels {
         }
     };
     MenuLabels {
+        pets_disabled: p(
+            "Disable Active Pets",
+            "활성 펫 비활성화 (일시 중지)",
+            "アクティブなペットを無効化",
+            "停用啟用中的寵物",
+        ),
         spawn_char: p("Spawn Character", "캐릭터 띄우기", "キャラクターを表示", "顯示角色"),
         none: p("(None)", "(없음)", "（なし）", "（無）"),
         pet_quick: p("Pet Quick Settings", "펫 빠른 설정", "ペットのクイック設定", "寵物快速設定"),
@@ -502,7 +519,7 @@ pub fn menu_labels(lang: &str) -> MenuLabels {
             "BUG Clickerから再読み込み",
             "從 BUG Clicker 重新載入",
         ),
-        launch_at_login: p("Launch at Login", "컴퓨터 켤 때 같이 실행", "PC起動時に起動", "開機時一起啟動"),
+        launch_at_login: p("Start with Windows", "컴퓨터 켤 때 같이 실행", "PC起動時に起動", "開機時一起啟動"),
         quit: p("Quit", "종료", "終了", "結束"),
         size: p("Size", "크기", "サイズ", "大小"),
         larger: p("Larger (+10px)", "더 크게 (+10px)", "大きく (+10px)", "放大 (+10px)"),
@@ -837,6 +854,11 @@ fn build_global_menu(
 ) -> Option<MenuGuard> {
     let menu = MenuGuard::new()?;
 
+    // Rust-only quick pause toggle
+    let id = push_action(actions, 0, TrayAction::TogglePetsDisabled);
+    append_item(&menu, id, labels.pets_disabled, state.pets_disabled);
+    append_separator(&menu);
+
     // Spawn Character
     let spawn = MenuGuard::new()?;
     if state.characters.is_empty() {
@@ -1073,9 +1095,11 @@ mod tests {
 
     #[test]
     fn tooltip_formats_ko_and_en() {
-        assert_eq!(format_tooltip(2, "en"), "BUG Clicker RS · 2");
-        assert_eq!(format_tooltip(3, "ko"), "BUG Clicker RS · 3명");
-        assert_eq!(format_tooltip(1, "ko-KR"), "BUG Clicker RS · 1명");
+        assert_eq!(format_tooltip(2, false, "en"), "BUG Clicker RS · 2");
+        assert_eq!(format_tooltip(3, false, "ko"), "BUG Clicker RS · 3명");
+        assert_eq!(format_tooltip(1, false, "ko-KR"), "BUG Clicker RS · 1명");
+        assert_eq!(format_tooltip(2, true, "en"), "BUG Clicker RS · Paused (2)");
+        assert_eq!(format_tooltip(2, true, "ko"), "BUG Clicker RS · 일시 중지 (2명)");
     }
 
     #[test]
@@ -1158,6 +1182,7 @@ mod tests {
         let state = GlobalMenuState {
             characters: &chars,
             pets: &pets,
+            pets_disabled: false,
             ghost: false,
             launch_at_login: false,
             react: &react,
@@ -1168,20 +1193,21 @@ mod tests {
         let menu = build_global_menu(&state, &labels, &mut table).expect("global menu");
         drop(menu);
 
-        // Spawn entries come first.
+        // Quick disable toggle sits at index 1, followed by Spawn entries.
+        assert_eq!(action_from_cmd_id(1, &table), Some(TrayAction::TogglePetsDisabled));
         assert_eq!(
-            action_from_cmd_id(1, &table),
+            action_from_cmd_id(2, &table),
             Some(TrayAction::SpawnCharacter("AlphaPet".to_string()))
         );
         assert_eq!(
-            action_from_cmd_id(2, &table),
+            action_from_cmd_id(3, &table),
             Some(TrayAction::SpawnCharacter("BetaPet".to_string()))
         );
 
         // Per-pet blocks are wrapped and contiguous, in order.
         let n1 = pet_actions(&pets[0]).len();
         let n2 = pet_actions(&pets[1]).len();
-        let first = 2 + 1;
+        let first = 3 + 1;
         assert_eq!(
             action_from_cmd_id(first as u32, &table),
             Some(TrayAction::PetQuick {
@@ -1245,6 +1271,7 @@ mod tests {
         let state = GlobalMenuState {
             characters: &chars,
             pets: &pets,
+            pets_disabled: true,
             ghost: true,
             launch_at_login: true,
             react: &react,

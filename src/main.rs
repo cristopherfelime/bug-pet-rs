@@ -36,8 +36,8 @@ use crate::window::{
     compute_overlay_rect_px, create_pet_window, create_tray_host_window, destroy_all_windows,
     destroy_pet_window, enable_per_monitor_dpi_v2, ensure_and_position_overlay, enumerate_monitors,
     hide_overlay, move_pet_window_px, pick_monitor_for_phys_point, register_window_class,
-    resize_pet_window_to_size, resolve_pet_dpr, set_pet_always_on_top, sync_click_through,
-    MonitorMetrics, PendingUiAction, SharedAppEvents,
+    resize_pet_window_to_size, resolve_pet_dpr, set_pet_always_on_top, set_pet_window_visible,
+    sync_click_through, MonitorMetrics, PendingUiAction, SharedAppEvents,
 };
 use chrono::Local;
 use serde_json::json;
@@ -188,6 +188,7 @@ fn spawn_pets_from_state(
     monitors: &[MonitorMetrics],
     shared: &Rc<RefCell<SharedAppEvents>>,
     char_cache: &mut HashMap<(String, u32), Arc<CharacterGpuTextures>>,
+    initially_visible: bool,
     now_s: f64,
 ) -> Result<(), String> {
     for pet in &state.pets {
@@ -212,8 +213,11 @@ fn spawn_pets_from_state(
             uploaded
         };
 
-        let runtime = PetRuntime::new(pet.clone(), state.prefs.ui.clone(), gpu_chars, now_s);
-        let pw = create_pet_window(pet.clone(), runtime, gpu, monitors, shared)?;
+        let mut runtime = PetRuntime::new(pet.clone(), state.prefs.ui.clone(), gpu_chars, now_s);
+        if !initially_visible {
+            runtime.set_resting(true);
+        }
+        let pw = create_pet_window(pet.clone(), runtime, gpu, monitors, shared, initially_visible)?;
         let (rx, ry, rw, rh) = pw.rect_px;
         let rig_count = pw.runtime.rig.bundle.parts.len();
         println!(
@@ -247,12 +251,13 @@ fn sync_audio_and_typing_subsystems(
     react: &ReactPrefs,
     tray_hwnd: HWND,
     loopback: &mut Option<LoopbackHandle>,
+    pets_disabled: bool,
 ) {
     let (any_music, any_typing) = {
         let mut st = shared.borrow_mut();
         st.key_every = react.key_every.max(1);
-        let m = st.pets.iter().any(|p| p.runtime.state.music);
-        let t = st.pets.iter().any(|p| p.runtime.state.typing);
+        let m = !pets_disabled && st.pets.iter().any(|p| p.runtime.state.music);
+        let t = !pets_disabled && st.pets.iter().any(|p| p.runtime.state.typing);
         (m, t)
     };
 
@@ -308,6 +313,7 @@ fn apply_pet_quick_action(
     loopback: &mut Option<LoopbackHandle>,
     tray_icon: &Option<TrayIcon>,
     state: &AppState,
+    pets_disabled: bool,
 ) {
     let mut need_audio_sync = false;
     match action {
@@ -511,14 +517,20 @@ fn apply_pet_quick_action(
             };
             persister.patch_spawn_or_remove_pet(pet_id, None);
             if let Some(ref ti) = *tray_icon {
-                ti.update_count(remaining, &state.prefs.ui.lang);
+                ti.update_count(remaining, pets_disabled, &state.prefs.ui.lang);
             }
             need_audio_sync = true;
         }
     }
 
     if need_audio_sync {
-        sync_audio_and_typing_subsystems(shared, &state.prefs.react, tray_hwnd, loopback);
+        sync_audio_and_typing_subsystems(
+            shared,
+            &state.prefs.react,
+            tray_hwnd,
+            loopback,
+            pets_disabled,
+        );
     }
 }
 
@@ -539,6 +551,7 @@ fn reload_from_source_live(
     tray_hwnd: HWND,
     loopback: &mut Option<LoopbackHandle>,
     tray_icon: &Option<TrayIcon>,
+    pets_disabled: bool,
     now_s: f64,
 ) -> Result<(), String> {
     let new_state = persister.reload_from_source()?;
@@ -572,22 +585,27 @@ fn reload_from_source_live(
         monitors,
         shared,
         char_cache,
+        !pets_disabled,
         now_s,
     )?;
 
     let count = {
         let mut st = shared.borrow_mut();
-        for pw in &mut st.pets {
-            pw.runtime.render(gpu, &pw.surface, now_s)?;
+        if !pets_disabled {
+            for pw in &mut st.pets {
+                pw.runtime.render(gpu, &pw.surface, now_s)?;
+            }
         }
         st.pets.len()
     };
     if let Some(ref ti) = *tray_icon {
-        ti.update_count(count, &state.prefs.ui.lang);
+        ti.update_count(count, pets_disabled, &state.prefs.ui.lang);
     }
-    sync_audio_and_typing_subsystems(shared, &state.prefs.react, tray_hwnd, loopback);
-    sync_click_through(shared);
-    gpu.commit()?;
+    sync_audio_and_typing_subsystems(shared, &state.prefs.react, tray_hwnd, loopback, pets_disabled);
+    if !pets_disabled {
+        sync_click_through(shared);
+        gpu.commit()?;
+    }
     Ok(())
 }
 
@@ -618,6 +636,7 @@ fn run() -> Result<(), String> {
     let mut available_chars = list_available_characters(&data_dir);
 
     let mut remind_sched = RemindScheduler::from_json(&state.remind);
+    let mut pets_disabled = cli.smoke_ms.is_none() && persister.pets_disabled();
     let mut launch_at_login = if persist_enabled {
         is_autostart_enabled()
     } else {
@@ -625,11 +644,12 @@ fn run() -> Result<(), String> {
     };
 
     println!(
-        "[bug-pet-rs] Data dir: {} (protect={}, persist={}, state={})",
+        "[bug-pet-rs] Data dir: {} (protect={}, persist={}, state={}, paused={})",
         data_dir.display(),
         protect.mode,
         persister.is_enabled(),
-        if from_sidecar { "sidecar" } else { "bug-clicker" }
+        if from_sidecar { "sidecar" } else { "bug-clicker" },
+        pets_disabled
     );
     println!(
         "[bug-pet-rs] GPU adapter ({:?}): {}",
@@ -685,6 +705,7 @@ fn run() -> Result<(), String> {
         &monitors,
         &shared,
         &mut char_cache,
+        !pets_disabled,
         0.0,
     )?;
 
@@ -696,6 +717,7 @@ fn run() -> Result<(), String> {
         tray_hwnd,
         Some(&data_dir),
         shared.borrow().pets.len(),
+        pets_disabled,
         &state.prefs.ui.lang,
     ) {
         Ok(ti) => Some(ti),
@@ -706,16 +728,24 @@ fn run() -> Result<(), String> {
     };
 
     let mut loopback: Option<LoopbackHandle> = None;
-    sync_audio_and_typing_subsystems(&shared, &state.prefs.react, tray_hwnd, &mut loopback);
+    sync_audio_and_typing_subsystems(
+        &shared,
+        &state.prefs.react,
+        tray_hwnd,
+        &mut loopback,
+        pets_disabled,
+    );
 
-    // Initial render before starting steady-state frame timer
-    {
-        let mut st = shared.borrow_mut();
-        for pw in &mut st.pets {
-            pw.runtime.render(&gpu, &pw.surface, 0.0)?;
+    // Initial render before starting steady-state frame timer (skip when starting paused)
+    if !pets_disabled {
+        {
+            let mut st = shared.borrow_mut();
+            for pw in &mut st.pets {
+                pw.runtime.render(&gpu, &pw.surface, 0.0)?;
+            }
         }
+        gpu.commit()?;
     }
-    gpu.commit()?;
 
     let wait_timer: Option<HANDLE> = unsafe {
         CreateWaitableTimerExW(
@@ -792,6 +822,7 @@ fn run() -> Result<(), String> {
                         let gm = GlobalMenuState {
                             characters: &available_chars,
                             pets: &pet_snaps,
+                            pets_disabled,
                             ghost: ghost_now,
                             launch_at_login,
                             react: &state.prefs.react,
@@ -803,6 +834,69 @@ fn run() -> Result<(), String> {
                         let mut react_dirty = false;
                         let mut ui_dirty = false;
                         match t_act {
+                            TrayAction::TogglePetsDisabled => {
+                                pets_disabled = !pets_disabled;
+                                persister.patch_pets_disabled(pets_disabled);
+                                let _ = persister.flush();
+                                if pets_disabled {
+                                    let count = {
+                                        let mut st = shared.borrow_mut();
+                                        st.dragging_hwnd = None;
+                                        st.drag_moved = false;
+                                        for pw in &mut st.pets {
+                                            pw.runtime.bubble.hide(now_s);
+                                            pw.runtime.radial.close(now_s);
+                                            pw.runtime.active_remind = None;
+                                            pw.runtime.remind_queue.clear();
+                                            pw.runtime.pending_say_pool = None;
+                                            pw.runtime.pending_say_text = None;
+                                            pw.runtime.pet_fx.reset_immediate();
+                                            pw.runtime.set_resting(true);
+                                            set_pet_window_visible(pw, false);
+                                        }
+                                        st.pets.len()
+                                    };
+                                    sync_audio_and_typing_subsystems(
+                                        &shared,
+                                        &state.prefs.react,
+                                        tray_hwnd,
+                                        &mut loopback,
+                                        true,
+                                    );
+                                    if let Some(ref ti) = tray_icon {
+                                        ti.update_count(count, true, &state.prefs.ui.lang);
+                                    }
+                                    println!("[bug-pet-rs] Active pets disabled (paused until toggled back on).");
+                                } else {
+                                    let count = {
+                                        let mut st = shared.borrow_mut();
+                                        for pw in &mut st.pets {
+                                            pw.runtime.set_resting(false);
+                                            set_pet_window_visible(pw, true);
+                                            pw.runtime.render(&gpu, &pw.surface, now_s)?;
+                                        }
+                                        st.pets.len()
+                                    };
+                                    sync_click_through(&shared);
+                                    gpu.commit()?;
+                                    sync_audio_and_typing_subsystems(
+                                        &shared,
+                                        &state.prefs.react,
+                                        tray_hwnd,
+                                        &mut loopback,
+                                        false,
+                                    );
+                                    was_resting = false;
+                                    last_tick = now;
+                                    next_frame = now;
+                                    last_remind_ms = Local::now().timestamp_millis();
+                                    next_remind_check = now + Duration::from_secs(15);
+                                    if let Some(ref ti) = tray_icon {
+                                        ti.update_count(count, false, &state.prefs.ui.lang);
+                                    }
+                                    println!("[bug-pet-rs] Active pets re-enabled.");
+                                }
+                            }
                             TrayAction::SpawnCharacter(char_id) => {
                                 let mut pt = POINT::default();
                                 let _ = unsafe { GetCursorPos(&mut pt) };
@@ -845,18 +939,22 @@ fn run() -> Result<(), String> {
                                         music: true,
                                         ..Default::default()
                                     };
-                                    let runtime = PetRuntime::new(
+                                    let mut runtime = PetRuntime::new(
                                         pet_st.clone(),
                                         state.prefs.ui.clone(),
                                         gc,
                                         now_s,
                                     );
+                                    if pets_disabled {
+                                        runtime.set_resting(true);
+                                    }
                                     if let Ok(pw) = create_pet_window(
                                         pet_st.clone(),
                                         runtime,
                                         &gpu,
                                         &monitors,
                                         &shared,
+                                        !pets_disabled,
                                     ) {
                                         persister.patch_spawn_or_remove_pet(&id, Some(&pet_st));
                                         let count = {
@@ -866,13 +964,18 @@ fn run() -> Result<(), String> {
                                             st.pets.len()
                                         };
                                         if let Some(ref ti) = tray_icon {
-                                            ti.update_count(count, &state.prefs.ui.lang);
+                                            ti.update_count(
+                                                count,
+                                                pets_disabled,
+                                                &state.prefs.ui.lang,
+                                            );
                                         }
                                         sync_audio_and_typing_subsystems(
                                             &shared,
                                             &state.prefs.react,
                                             tray_hwnd,
                                             &mut loopback,
+                                            pets_disabled,
                                         );
                                     }
                                 }
@@ -912,14 +1015,23 @@ fn run() -> Result<(), String> {
                             }
                             TrayAction::ToggleLaunchAtLogin => {
                                 let want = !launch_at_login;
-                                if set_autostart_enabled(
+                                match set_autostart_enabled(
                                     want,
                                     cli.data_dir.as_deref().map(Path::new),
-                                )
-                                .is_ok()
-                                {
-                                    launch_at_login = want;
-                                    persister.patch_launch_at_login(want);
+                                ) {
+                                    Ok(()) => {
+                                        launch_at_login = want;
+                                        persister.patch_launch_at_login(want);
+                                        println!(
+                                            "[bug-pet-rs] Start with Windows: {}.",
+                                            if want { "enabled" } else { "disabled" }
+                                        );
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[bug-pet-rs] Failed updating Start with Windows: {e}"
+                                        );
+                                    }
                                 }
                             }
                             TrayAction::ReloadFromSource => {
@@ -939,6 +1051,7 @@ fn run() -> Result<(), String> {
                                     tray_hwnd,
                                     &mut loopback,
                                     &tray_icon,
+                                    pets_disabled,
                                     now_s,
                                 ) {
                                     eprintln!("[bug-pet-rs] Reload from BUG Clicker failed: {e}");
@@ -961,6 +1074,7 @@ fn run() -> Result<(), String> {
                                     &mut loopback,
                                     &tray_icon,
                                     &state,
+                                    pets_disabled,
                                 );
                             }
                             TrayAction::SetReactSense(s) => {
@@ -1010,6 +1124,7 @@ fn run() -> Result<(), String> {
                                 &state.prefs.react,
                                 tray_hwnd,
                                 &mut loopback,
+                                pets_disabled,
                             );
                         }
                         if ui_dirty {
@@ -1022,7 +1137,7 @@ fn run() -> Result<(), String> {
                                 st.pets.len()
                             };
                             if let Some(ref ti) = tray_icon {
-                                ti.update_count(count, &state.prefs.ui.lang);
+                                ti.update_count(count, pets_disabled, &state.prefs.ui.lang);
                             }
                             persister.patch_ui_prefs(&state.prefs.ui);
                         }
@@ -1174,6 +1289,7 @@ fn run() -> Result<(), String> {
                                             &mut loopback,
                                             &tray_icon,
                                             &state,
+                                            pets_disabled,
                                         );
                                     }
                                 }
@@ -1190,6 +1306,7 @@ fn run() -> Result<(), String> {
                                     &mut loopback,
                                     &tray_icon,
                                     &state,
+                                    pets_disabled,
                                 );
                             }
                             RadialAction::QuitAll => {
@@ -1232,34 +1349,36 @@ fn run() -> Result<(), String> {
         if now >= next_remind_check {
             next_remind_check = now + Duration::from_secs(15);
             let now_ms = Local::now().timestamp_millis();
-            let pet_tuples: Vec<(String, String, bool)> = shared
-                .borrow()
-                .pets
-                .iter()
-                .map(|p| (p.runtime.id.clone(), p.runtime.state.char_id.clone(), false))
-                .collect();
-            let events = remind_sched.tick(last_remind_ms, now_ms, &pet_tuples);
-            last_remind_ms = now_ms;
-            for alarm_id in remind_sched.take_disabled_alarm_ids() {
-                persister.patch_alarm_off(&alarm_id);
-            }
-            if !events.is_empty() {
-                let mut st = shared.borrow_mut();
-                for ev in events {
-                    if let Some((ref snd_kind, vol)) = ev.sound {
-                        if let Some(ref se) = st.sound_engine {
-                            se.play_alert(snd_kind, vol);
+            if !pets_disabled {
+                let pet_tuples: Vec<(String, String, bool)> = shared
+                    .borrow()
+                    .pets
+                    .iter()
+                    .map(|p| (p.runtime.id.clone(), p.runtime.state.char_id.clone(), false))
+                    .collect();
+                let events = remind_sched.tick(last_remind_ms, now_ms, &pet_tuples);
+                for alarm_id in remind_sched.take_disabled_alarm_ids() {
+                    persister.patch_alarm_off(&alarm_id);
+                }
+                if !events.is_empty() {
+                    let mut st = shared.borrow_mut();
+                    for ev in events {
+                        if let Some((ref snd_kind, vol)) = ev.sound {
+                            if let Some(ref se) = st.sound_engine {
+                                se.play_alert(snd_kind, vol);
+                            }
                         }
-                    }
-                    if let Some(pw) = st
-                        .pets
-                        .iter_mut()
-                        .find(|p| p.runtime.id == ev.target_pet_id)
-                    {
-                        pw.runtime.push_remind(ev, now_s);
+                        if let Some(pw) = st
+                            .pets
+                            .iter_mut()
+                            .find(|p| p.runtime.id == ev.target_pet_id)
+                        {
+                            pw.runtime.push_remind(ev, now_s);
+                        }
                     }
                 }
             }
+            last_remind_ms = now_ms;
         }
 
         // Automatic live sync when original BUG Clicker updates state.json
@@ -1282,6 +1401,7 @@ fn run() -> Result<(), String> {
                     tray_hwnd,
                     &mut loopback,
                     &tray_icon,
+                    pets_disabled,
                     now_s,
                 ) {
                     Ok(()) => {
@@ -1309,136 +1429,141 @@ fn run() -> Result<(), String> {
             }
         }
 
-        let mut beats: Vec<BeatEvent> = Vec::new();
-        if let Some(ref lb) = loopback {
-            while let Some(ev) = lb.try_recv_beat() {
-                beats.push(ev);
-            }
-        }
-
-        // Music-aware OS idle check at 1 Hz
-        let audio_playing =
-            loopback.as_ref().is_some_and(|lb| lb.is_playing()) || !beats.is_empty();
-        let interacting = {
-            let st = shared.borrow();
-            st.dragging_hwnd.is_some()
-                || st.pets.iter().any(|p| {
-                    p.runtime.down
-                        || p.runtime.release_due_s.is_some()
-                        || p.runtime.has_overlay_content(now_s)
-                        || p.runtime.pet_fx.is_active(now_s)
-                })
-        };
-
-        let mut currently_resting = was_resting;
-        if audio_playing || interacting {
-            currently_resting = false;
-        } else if state.prefs.ui.rest_idle && now >= next_idle_check {
-            next_idle_check = now + Duration::from_secs(1);
-            let idle_s = system_idle_seconds();
-            currently_resting = idle_s >= rest_limit_s;
-        } else if !state.prefs.ui.rest_idle {
-            currently_resting = false;
-        }
-
-        if currently_resting != was_resting {
-            let mut st = shared.borrow_mut();
-            for pw in &mut st.pets {
-                pw.runtime.set_resting(currently_resting);
-            }
-            if !currently_resting {
-                last_tick = now;
-                next_frame = now;
-            }
-        }
-
-        let stay_frozen_idle = currently_resting && was_resting;
-        was_resting = currently_resting;
-
-        let sleep_dur = if stay_frozen_idle {
+        let sleep_dur = if pets_disabled {
             Duration::from_millis(250)
         } else {
-            let dt_s = (now - last_tick).as_secs_f32().clamp(0.001, 0.05);
-            last_tick = now;
+            let mut beats: Vec<BeatEvent> = Vec::new();
+            if let Some(ref lb) = loopback {
+                while let Some(ev) = lb.try_recv_beat() {
+                    beats.push(ev);
+                }
+            }
 
-            {
-                let shared_ptr = Rc::as_ptr(&shared) as isize;
+            // Music-aware OS idle check at 1 Hz
+            let audio_playing =
+                loopback.as_ref().is_some_and(|lb| lb.is_playing()) || !beats.is_empty();
+            let interacting = {
+                let st = shared.borrow();
+                st.dragging_hwnd.is_some()
+                    || st.pets.iter().any(|p| {
+                        p.runtime.down
+                            || p.runtime.release_due_s.is_some()
+                            || p.runtime.has_overlay_content(now_s)
+                            || p.runtime.pet_fx.is_active(now_s)
+                    })
+            };
+
+            let mut currently_resting = was_resting;
+            if audio_playing || interacting {
+                currently_resting = false;
+            } else if state.prefs.ui.rest_idle && now >= next_idle_check {
+                next_idle_check = now + Duration::from_secs(1);
+                let idle_s = system_idle_seconds();
+                currently_resting = idle_s >= rest_limit_s;
+            } else if !state.prefs.ui.rest_idle {
+                currently_resting = false;
+            }
+
+            if currently_resting != was_resting {
                 let mut st = shared.borrow_mut();
-                let fire_test_beat = if now_s >= next_test_beat_s {
-                    next_test_beat_s += test_beat_iv_s;
-                    true
-                } else {
-                    false
-                };
-
-                let mut delayed_ups: Vec<(String, f64)> = Vec::new();
-                let mut ov_map = std::mem::take(&mut st.overlay_map);
                 for pw in &mut st.pets {
-                    if !currently_resting {
-                        if fire_test_beat && pw.runtime.state.music {
-                            pw.runtime.on_beat(0.85, test_beat_iv_s, now_s);
-                        }
-                        for ev in &beats {
-                            if pw.runtime.state.music {
-                                pw.runtime.on_beat(ev.strength, ev.interval_s, now_s);
+                    pw.runtime.set_resting(currently_resting);
+                }
+                if !currently_resting {
+                    last_tick = now;
+                    next_frame = now;
+                }
+            }
+
+            let stay_frozen_idle = currently_resting && was_resting;
+            was_resting = currently_resting;
+
+            if stay_frozen_idle {
+                Duration::from_millis(250)
+            } else {
+                let dt_s = (now - last_tick).as_secs_f32().clamp(0.001, 0.05);
+                last_tick = now;
+
+                {
+                    let shared_ptr = Rc::as_ptr(&shared) as isize;
+                    let mut st = shared.borrow_mut();
+                    let fire_test_beat = if now_s >= next_test_beat_s {
+                        next_test_beat_s += test_beat_iv_s;
+                        true
+                    } else {
+                        false
+                    };
+
+                    let mut delayed_ups: Vec<(String, f64)> = Vec::new();
+                    let mut ov_map = std::mem::take(&mut st.overlay_map);
+                    for pw in &mut st.pets {
+                        if !currently_resting {
+                            if fire_test_beat && pw.runtime.state.music {
+                                pw.runtime.on_beat(0.85, test_beat_iv_s, now_s);
+                            }
+                            for ev in &beats {
+                                if pw.runtime.state.music {
+                                    pw.runtime.on_beat(ev.strength, ev.interval_s, now_s);
+                                }
                             }
                         }
-                    }
-                    if pw.runtime.step(now_s, dt_s) {
-                        if let Some((kind, vol)) = pw.runtime.click_sound_params() {
-                            delayed_ups.push((kind.to_string(), vol));
+                        if pw.runtime.step(now_s, dt_s) {
+                            if let Some((kind, vol)) = pw.runtime.click_sound_params() {
+                                delayed_ups.push((kind.to_string(), vol));
+                            }
                         }
-                    }
-                    pw.runtime.render(&gpu, &pw.surface, now_s)?;
+                        pw.runtime.render(&gpu, &pw.surface, now_s)?;
 
-                    let need_overlay = pw.runtime.has_overlay_content(now_s)
-                        || pw.runtime.pending_say_pool.is_some();
-                    if need_overlay {
-                        let want_focus = pw.runtime.radial.is_visible();
-                        let want_topmost = pw.runtime.state.always_on_top || want_focus;
-                        ensure_and_position_overlay(
-                            pw,
-                            &gpu,
-                            &monitors,
-                            shared_ptr,
-                            &mut ov_map,
-                            want_focus,
-                            want_topmost,
-                        )?;
-                        if let Some(ref ov) = pw.overlay {
-                            pw.runtime.update_and_render_overlay(
+                        let need_overlay = pw.runtime.has_overlay_content(now_s)
+                            || pw.runtime.pending_say_pool.is_some()
+                            || pw.runtime.pending_say_text.is_some();
+                        if need_overlay {
+                            let want_focus = pw.runtime.radial.is_visible();
+                            let want_topmost = pw.runtime.state.always_on_top || want_focus;
+                            ensure_and_position_overlay(
+                                pw,
                                 &gpu,
-                                &ov.surface,
-                                pw.rect_px,
-                                ov.rect_px,
-                                ov.dpr,
-                                now_s,
+                                &monitors,
+                                shared_ptr,
+                                &mut ov_map,
+                                want_focus,
+                                want_topmost,
                             )?;
-                        }
-                        if !pw.runtime.has_overlay_content(now_s) {
+                            if let Some(ref ov) = pw.overlay {
+                                pw.runtime.update_and_render_overlay(
+                                    &gpu,
+                                    &ov.surface,
+                                    pw.rect_px,
+                                    ov.rect_px,
+                                    ov.dpr,
+                                    now_s,
+                                )?;
+                            }
+                            if !pw.runtime.has_overlay_content(now_s) {
+                                hide_overlay(pw);
+                            }
+                        } else {
                             hide_overlay(pw);
                         }
-                    } else {
-                        hide_overlay(pw);
+                    }
+                    st.overlay_map = ov_map;
+
+                    if let Some(ref se) = st.sound_engine {
+                        for (kind, vol) in delayed_ups {
+                            se.play_click(&kind, true, vol, 0.0);
+                        }
                     }
                 }
-                st.overlay_map = ov_map;
+                sync_click_through(&shared);
+                gpu.commit()?;
+                frames_rendered += 1;
 
-                if let Some(ref se) = st.sound_engine {
-                    for (kind, vol) in delayed_ups {
-                        se.play_click(&kind, true, vol, 0.0);
-                    }
+                let now_after = Instant::now();
+                while next_frame <= now_after {
+                    next_frame += target_frame_dt;
                 }
+                next_frame.saturating_duration_since(now_after)
             }
-            sync_click_through(&shared);
-            gpu.commit()?;
-            frames_rendered += 1;
-
-            let now_after = Instant::now();
-            while next_frame <= now_after {
-                next_frame += target_frame_dt;
-            }
-            next_frame.saturating_duration_since(now_after)
         };
 
         if let Some(th) = wait_timer {

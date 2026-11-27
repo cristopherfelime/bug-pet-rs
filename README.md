@@ -27,7 +27,7 @@ Numbers depend on hardware, driver, display setup, and the number/complexity of 
 - **Petting** – click/drag interactions with petting particles and squish/swing motion.
 - **Lazy overlays** – speech bubbles and the radial action wheel are created on demand and torn down afterwards.
 - **Native tray and quick-tweak menus** – plain Win32 popup menus, localized for English, Korean, Japanese and Chinese.
-- **Reminders** – built-in reminder bubbles.
+- **Reminders** – built-in reminder badges and `sp_*_before` / `sp_*_after` special lines (alarms, medication, hydration, to-do, custom groups, `{memo}` substitution, and per-line bubble styles).
 - **Safe persistence and auto-sync** – native tweaks are stored separately and never overwrite the original BUG Clicker data (see [Auto-Sync](#auto-sync-with-bug-clicker)).
 
 ## Prerequisites and Build
@@ -69,17 +69,18 @@ Do not commit or share key material.
 ## Controls and Quick Tweaks
 
 - **Drag** a pet to move it, **pet** it for particles and reactions, and use the **radial wheel** for quick actions.
-- **Tray icon (right-click)**:
+- **Tray icon (right-click or left-click)**:
+  - *Disable Active Pets* – Rust-exclusive quick toggle that hides all pet windows & overlays and pauses GPU rendering, WASAPI audio capture, typing hooks, and reminders until toggled back on (saved locally under `_bugPetRsLocal` in `%APPDATA%\bug-pet-rs\state.json`, surviving reboots and BUG Clicker syncs)
   - *Spawn Character* – add any installed character
   - *Pet Quick Settings* – one submenu per active pet: size (±10 px and presets), flip, lock position, click-through, always on top, mute, react to music / typing, OBS key background (transparent / green / blue / magenta), rig-part toggles, close pet
   - *Quick Settings* – music sensitivity, sound mode, audio gain, typing cadence, rest when idle and timeout, bubble font size, lite / reduce motion, language
-  - *Gather All*, *Ghost Click-Through*, *Reload from BUG Clicker*, *Launch at Login*, *Quit*
+  - *Gather All*, *Ghost Click-Through*, *Reload from BUG Clicker*, *Start with Windows*, *Quit*
 - **Per-pet radial Settings icon** – opens the same per-pet quick-tweak popup directly at the cursor.
 
 ### Auto-Sync with BUG Clicker
 
 - On startup and while running, `bug-pet-rs` live-syncs from the original BUG Clicker `state.json`, so changes made in the original app show up automatically (or on demand via *Reload from BUG Clicker*).
-- The original data is **kept untouched** by default. Tweaks made in `bug-pet-rs` are saved to its own file at `%APPDATA%\bug-pet-rs\state.json`.
+- The original data is **kept untouched** by default. Tweaks made in `bug-pet-rs` are saved to its own file at `%APPDATA%\bug-pet-rs\state.json` (and *Start with Windows* uses its own `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\BugPetRs` key, separate from BUG Clicker).
 - Use `--read-only` to disable all writes entirely.
 
 ## Command-Line Flags

@@ -17,6 +17,9 @@ pub const DEBOUNCE_MS: u64 = 400;
 /// Sidecar key recording which BUG Clicker `state.json` revision the sidecar derives from.
 const SYNC_KEY: &str = "_bugPetRsSync";
 
+/// Sidecar-only key storing `bug-pet-rs` local toggles (not synced from BUG Clicker).
+const LOCAL_KEY: &str = "_bugPetRsLocal";
+
 /// Cheap fingerprint (mtime + length) of the source `state.json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceMeta {
@@ -79,6 +82,10 @@ fn read_source_snapshot(path: &Path) -> Result<(Value, AppState, Option<SourceSi
         sha256: sha256_hex(&bytes),
     });
     Ok((val, state, sig))
+}
+
+fn extract_local_block(val: &Value) -> Option<Value> {
+    val.get(LOCAL_KEY).filter(|v| v.is_object()).cloned()
 }
 
 fn stamp_sync(doc: &mut Value, sig: Option<&SourceSig>) {
@@ -245,15 +252,19 @@ impl StatePersister {
             None
         };
 
-        if let (Some(target), Some(sig)) = (target.as_ref(), src_sig.as_ref()) {
+        let mut saved_local: Option<Value> = None;
+        if let Some(target) = target.as_ref() {
             if target.is_file() {
                 if let Ok(text) = fs::read_to_string(target) {
                     if let Ok(target_val) = serde_json::from_str::<Value>(&text) {
-                        let hash_matches = target_val
-                            .get(SYNC_KEY)
-                            .and_then(|s| s.get("sourceSha256"))
-                            .and_then(|v| v.as_str())
-                            == Some(sig.sha256.as_str());
+                        saved_local = extract_local_block(&target_val);
+                        let hash_matches = src_sig.as_ref().is_some_and(|sig| {
+                            target_val
+                                .get(SYNC_KEY)
+                                .and_then(|s| s.get("sourceSha256"))
+                                .and_then(|v| v.as_str())
+                                == Some(sig.sha256.as_str())
+                        });
                         if hash_matches {
                             if let Ok(state) =
                                 serde_json::from_value::<AppState>(target_val.clone())
@@ -278,6 +289,9 @@ impl StatePersister {
         }
 
         stamp_sync(&mut src_val, src_sig.as_ref());
+        if let Some(local) = saved_local {
+            ensure_obj(&mut src_val).insert(LOCAL_KEY.to_string(), local);
+        }
         let stale_sidecar = target.as_ref().is_some_and(|t| t.is_file());
         let mut persister = Self {
             persist_enabled,
@@ -319,12 +333,34 @@ impl StatePersister {
     #[allow(dead_code)]
     pub fn reload_from_source(&mut self) -> Result<AppState, String> {
         let (mut val, state, sig) = read_source_snapshot(&self.source_path)?;
+        let saved_local = extract_local_block(&self.doc);
         stamp_sync(&mut val, sig.as_ref());
+        if let Some(local) = saved_local {
+            ensure_obj(&mut val).insert(LOCAL_KEY.to_string(), local);
+        }
         self.doc = val;
         self.last_source_sig = sig;
         self.dirty = self.persist_enabled && self.target_path.as_ref().is_some_and(|p| p.is_file());
         self.dirty_since = if self.dirty { Some(Instant::now()) } else { None };
         Ok(state)
+    }
+
+    #[allow(dead_code)]
+    pub fn pets_disabled(&self) -> bool {
+        self.doc
+            .get(LOCAL_KEY)
+            .and_then(|v| v.get("petsDisabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    #[allow(dead_code)]
+    pub fn patch_pets_disabled(&mut self, disabled: bool) {
+        self.record_patch(|doc| {
+            let root = ensure_obj(doc);
+            let local = ensure_obj(root.entry(LOCAL_KEY.to_string()).or_insert_with(|| json!({})));
+            local.insert("petsDisabled".to_string(), json!(disabled));
+        });
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -1064,6 +1100,38 @@ mod tests {
         p.flush().unwrap();
         let v2: Value = serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
         assert_eq!(v2["pets"].as_array().unwrap().len(), 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pets_disabled_persists_only_in_sidecar_and_survives_source_reload() {
+        let dir = temp_test_dir("pets-disabled");
+        let source = dir.join("source.json");
+        let target = dir.join("appdata").join("state.json");
+        let src_v1 = source_json(10.0, "v1");
+        fs::write(&source, &src_v1).unwrap();
+
+        let (_s, mut p, _) = load_synced_state(&source, true, Some(target.clone())).unwrap();
+        assert!(!p.pets_disabled());
+        p.patch_pets_disabled(true);
+        p.flush().unwrap();
+        assert!(p.pets_disabled());
+        assert_eq!(fs::read_to_string(&source).unwrap(), src_v1);
+
+        let src_v2 = source_json(77.0, "v2-updated-in-source");
+        fs::write(&source, &src_v2).unwrap();
+        let s_reloaded = p.reload_from_source().unwrap();
+        assert_eq!(s_reloaded.pets[0].x, 77.0);
+        assert!(p.pets_disabled());
+        p.flush().unwrap();
+        drop(p);
+
+        let (s_fresh, p2, from_sidecar) =
+            load_synced_state(&source, true, Some(target.clone())).unwrap();
+        assert!(from_sidecar);
+        assert_eq!(s_fresh.pets[0].x, 77.0);
+        assert!(p2.pets_disabled());
 
         let _ = fs::remove_dir_all(&dir);
     }

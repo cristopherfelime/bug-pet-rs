@@ -396,6 +396,7 @@ pub fn create_pet_window(
     gpu: &GpuContext,
     monitors: &[MonitorMetrics],
     shared: &Rc<RefCell<SharedAppEvents>>,
+    initially_visible: bool,
 ) -> Result<PetWindow, String> {
     let (rect_px, dpr) = resolve_pet_window_rect_px(&runtime, monitors);
     let (x, y, w, h) = rect_px;
@@ -417,13 +418,18 @@ pub fn create_pet_window(
         .chain(Some(0))
         .collect();
 
+    let style = if initially_visible {
+        WS_POPUP | WS_VISIBLE
+    } else {
+        WS_POPUP
+    };
     let ctx_ptr = Rc::as_ptr(shared) as isize;
     let hwnd = unsafe {
         CreateWindowExW(
             ex_style,
             PET_CLASS_NAME,
             PCWSTR(title.as_ptr()),
-            WS_POPUP | WS_VISIBLE,
+            style,
             x,
             y,
             w,
@@ -606,6 +612,20 @@ pub fn hide_overlay(pw: &mut PetWindow) {
             unsafe {
                 let _ = ShowWindow(ov.hwnd, SW_HIDE);
             }
+        }
+    }
+}
+
+pub fn set_pet_window_visible(pw: &mut PetWindow, visible: bool) {
+    if visible {
+        unsafe {
+            let _ = ShowWindow(pw.hwnd, SW_SHOWNOACTIVATE);
+        }
+        set_pet_always_on_top(pw, pw.runtime.state.always_on_top);
+    } else {
+        hide_overlay(pw);
+        unsafe {
+            let _ = ShowWindow(pw.hwnd, SW_HIDE);
         }
     }
 }

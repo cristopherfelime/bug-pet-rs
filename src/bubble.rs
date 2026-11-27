@@ -688,12 +688,66 @@ fn custom_override(cfg: &CharacterConfig, id: &str) -> Option<StyleOverride> {
     None
 }
 
+/// `pet.js fillMemo`: substitutes `{memo}`, `{메모}`, `{メモ}`, `{備註}` (case-insensitive for `memo`).
+pub fn fill_memo(template: &str, memo: &str) -> String {
+    if !template.contains('{') {
+        return template.to_string();
+    }
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after_open = &rest[open + 1..];
+        if let Some(close) = after_open.find('}') {
+            let token = &after_open[..close];
+            let is_memo = token.eq_ignore_ascii_case("memo")
+                || matches!(token, "메모" | "メモ" | "備註");
+            if is_memo {
+                out.push_str(memo);
+                rest = &after_open[close + 1..];
+                continue;
+            }
+        }
+        out.push('{');
+        rest = after_open;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Resolves reminder special-line pool key & items (`pet.js remLines(e, t)`), checking `sp_<group>_<phase>` first.
+pub fn resolve_remind_pool(
+    cfg: &CharacterConfig,
+    kind: &str,
+    group_id: &str,
+    phase: &str,
+) -> (String, Vec<String>) {
+    if !group_id.is_empty() {
+        let gk = format!("sp_{group_id}_{phase}");
+        let gpool = pool(&cfg.special_lines_for_key(&gk));
+        if !gpool.is_empty() {
+            return (gk, gpool);
+        }
+    }
+    let kk = format!("sp_{kind}_{phase}");
+    let kpool = pool(&cfg.special_lines_for_key(&kk));
+    (kk, kpool)
+}
+
 /// `cfg[pool_key]` raw line list for the known pools.
 fn cfg_pool_lines<'a>(cfg: &'a CharacterConfig, pool_key: &str) -> Option<&'a [String]> {
     match pool_key {
         "lines" => Some(&cfg.lines),
         "idleLines" => Some(&cfg.idle_lines),
         "patLines" => Some(&cfg.pat_lines),
+        "sp_alarm_before" => Some(&cfg.sp_alarm_before),
+        "sp_alarm_after" => Some(&cfg.sp_alarm_after),
+        "sp_pill_before" => Some(&cfg.sp_pill_before),
+        "sp_pill_after" => Some(&cfg.sp_pill_after),
+        "sp_water_before" => Some(&cfg.sp_water_before),
+        "sp_water_after" => Some(&cfg.sp_water_after),
+        "sp_todo_before" => Some(&cfg.sp_todo_before),
+        "sp_todo_after" => Some(&cfg.sp_todo_after),
         _ => None,
     }
 }
@@ -717,8 +771,15 @@ pub fn style_of_line_in(
 
 /// `BubbleFx.styleOfLine`: style id attached to a line (matched by trimmed text and raw index).
 pub fn style_of_line(cfg: &CharacterConfig, pool_key: &str, text: &str) -> String {
-    let Some(raw) = cfg_pool_lines(cfg, pool_key) else { return String::new() };
-    style_of_line_in(cfg, pool_key, raw, text)
+    if let Some(raw) = cfg_pool_lines(cfg, pool_key) {
+        return style_of_line_in(cfg, pool_key, raw, text);
+    }
+    let extra = cfg.special_lines_for_key(pool_key);
+    if extra.is_empty() {
+        String::new()
+    } else {
+        style_of_line_in(cfg, pool_key, &extra, text)
+    }
 }
 
 impl ResolvedBubbleStyle {
@@ -3496,5 +3557,35 @@ mod tests {
         cs.tail = false;
         let (s, _, _) = rasterize_remind_badge("todo", "할 일", "하나 끝!", "눌러서 닫기", "09:00", true, Some(&cs), &fonts, 1.0);
         assert!(premultiplied_nonempty(&s));
+    }
+
+    #[test]
+    fn special_lines_memo_group_fallback_and_styles() {
+        assert_eq!(fill_memo("Check {memo} & {MEMO}!", "tea"), "Check tea & tea!");
+        assert_eq!(fill_memo("{메모} / {メモ} / {備註}", "task"), "task / task / task");
+        assert_eq!(fill_memo("{other} and {memo}", ""), "{other} and ");
+
+        let cfg: CharacterConfig = serde_json::from_value(serde_json::json!({
+            "sp_alarm_before": ["Alarm default {memo}"],
+            "sp_water_before": ["Drink water now"],
+            "sp_g1_before": ["Group one {memo}"],
+            "sp_g1_after": ["Group done!"],
+            "lineStyles": {
+                "sp_water_before": ["p_shout"],
+                "sp_g1_after": ["p_think"]
+            }
+        }))
+        .unwrap();
+
+        let (gk, gpool) = resolve_remind_pool(&cfg, "alarm", "g1", "before");
+        assert_eq!(gk, "sp_g1_before");
+        assert_eq!(gpool, vec!["Group one {memo}"]);
+
+        let (fk, fpool) = resolve_remind_pool(&cfg, "alarm", "g9", "before");
+        assert_eq!(fk, "sp_alarm_before");
+        assert_eq!(fpool, vec!["Alarm default {memo}"]);
+
+        assert_eq!(style_of_line(&cfg, "sp_water_before", "Drink water now"), "p_shout");
+        assert_eq!(style_of_line(&cfg, "sp_g1_after", "Group done!"), "p_think");
     }
 }

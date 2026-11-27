@@ -1,7 +1,7 @@
 use crate::assets::{downscale_if_larger, HitMask, LoadedCharacter};
 use crate::bubble::{
-    rasterize_bubble, rasterize_remind_badge, BubbleFrameState, BubbleRuntime, CharBox, DipRect,
-    FontStack, ResolvedBubbleStyle,
+    fill_memo, rasterize_bubble, rasterize_remind_badge, resolve_remind_pool, style_of_line,
+    BubbleFrameState, BubbleRuntime, CharBox, DipRect, FontStack, ResolvedBubbleStyle,
 };
 use crate::config::{
     parse_hex_color, parse_hex_color_rgba, BugGeometry, CharacterConfig, PetState, UiPrefs,
@@ -163,6 +163,14 @@ impl CharacterGpuTextures {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingSayText {
+    pub text: String,
+    pub min_ms: Option<f64>,
+    pub style_pool_key: Option<String>,
+    pub style_src: Option<String>,
+}
+
 pub struct ActiveRemind {
     pub event: RemindFireEvent,
     pub shown_at_s: f64,
@@ -174,6 +182,9 @@ pub struct ActiveRemind {
     pub box_h_dip: f64,
     pub hot_rect_local_dip: (f64, f64, f64, f64),
     pub is_icon_only: bool,
+    pub before_pool_key: Option<String>,
+    pub before_raw_line: Option<String>,
+    pub before_display_text: Option<String>,
 }
 
 pub struct PetRuntime {
@@ -202,6 +213,7 @@ pub struct PetRuntime {
     pub next_remind_at_s: Option<f64>,
     pub nod_nod_start_s: Option<f64>,
     pub pending_say_pool: Option<&'static str>,
+    pub pending_say_text: Option<PendingSayText>,
 
     bubble_tex: Option<GpuTexture>,
     bubble_dirty_key: u64,
@@ -284,6 +296,7 @@ impl PetRuntime {
             next_remind_at_s: None,
             nod_nod_start_s: None,
             pending_say_pool: None,
+            pending_say_text: None,
             bubble_tex: None,
             bubble_dirty_key: 0,
             bubble_pad: (0.0, 0.0),
@@ -449,6 +462,7 @@ impl PetRuntime {
         self.down = false;
         self.release_due_s = None;
         self.pending_say_pool = None;
+        self.pending_say_text = None;
         self.pet_fx.reset_immediate();
         self.bubble.hide(now_s);
         self.shiver.up();
@@ -578,9 +592,34 @@ impl PetRuntime {
         }
     }
 
+    fn format_remind_memo(ev: &RemindFireEvent) -> String {
+        if ev.kind == RemindKind::Todo && !ev.memo.is_empty() && ev.left_count > 1 {
+            format!("{} +{}", ev.memo, ev.left_count - 1)
+        } else {
+            ev.memo.clone()
+        }
+    }
+
     fn activate_remind(&mut self, ev: RemindFireEvent, now_s: f64) {
         self.bubble.hide(now_s);
+        self.pending_say_pool = None;
+        self.pending_say_text = None;
         self.next_remind_at_s = None;
+        let memo_text = Self::format_remind_memo(&ev);
+        let (pool_key, items) = resolve_remind_pool(
+            &self.gpu_chars.config,
+            ev.kind.as_str(),
+            &ev.group_id,
+            "before",
+        );
+        let (before_pool_key, before_raw_line, before_display_text, is_icon_only) =
+            if !items.is_empty() {
+                let raw = items[rand::thread_rng().gen_range(0..items.len())].clone();
+                let display = fill_memo(&raw, &memo_text);
+                (Some(pool_key), Some(raw), Some(display), false)
+            } else {
+                (None, None, None, memo_text.is_empty())
+            };
         self.active_remind = Some(ActiveRemind {
             event: ev,
             shown_at_s: now_s,
@@ -591,7 +630,10 @@ impl PetRuntime {
             box_w_dip: 58.0,
             box_h_dip: 44.0,
             hot_rect_local_dip: (0.0, 0.0, 0.0, 0.0),
-            is_icon_only: true,
+            is_icon_only,
+            before_pool_key,
+            before_raw_line,
+            before_display_text,
         });
     }
 
@@ -602,7 +644,27 @@ impl PetRuntime {
         self.down = true;
         self.press_start_s = now_s;
         self.release_due_s = Some(now_s + hold_s);
-        self.nod_nod_start_s = Some(now_s);
+
+        let mut spoke_after = false;
+        let cfg = &self.gpu_chars.config;
+        if cur.event.kind != RemindKind::Todo && cfg.bubble {
+            let (pool_key, items) =
+                resolve_remind_pool(cfg, cur.event.kind.as_str(), &cur.event.group_id, "after");
+            if !items.is_empty() {
+                let raw = items[rand::thread_rng().gen_range(0..items.len())].clone();
+                let text = fill_memo(&raw, &cur.event.memo);
+                self.pending_say_text = Some(PendingSayText {
+                    text,
+                    min_ms: Some(cfg.bubble_ms.max(2200.0)),
+                    style_pool_key: Some(pool_key),
+                    style_src: Some(raw),
+                });
+                spoke_after = true;
+            }
+        }
+        if !spoke_after {
+            self.nod_nod_start_s = Some(now_s);
+        }
         if !self.remind_queue.is_empty() {
             self.next_remind_at_s = Some(now_s + 1.6);
         }
@@ -718,7 +780,10 @@ impl PetRuntime {
         // Idle speech bubble polling
         let idle_busy =
             self.down || self.resting || self.dragging || self.active_remind.is_some() || self.radial.is_visible();
-        if self.bubble.poll_idle(cfg, now_s, idle_busy) && self.pending_say_pool.is_none() {
+        if self.bubble.poll_idle(cfg, now_s, idle_busy)
+            && self.pending_say_pool.is_none()
+            && self.pending_say_text.is_none()
+        {
             self.pending_say_pool = Some("idleLines");
         }
 
@@ -1097,6 +1162,22 @@ impl PetRuntime {
                 );
             }
         }
+        if let Some(pst) = self.pending_say_text.take() {
+            if self.active_remind.is_none() {
+                self.bubble.say_text(
+                    &pst.text,
+                    pst.min_ms,
+                    pst.style_pool_key.as_deref(),
+                    pst.style_src.as_deref(),
+                    cfg,
+                    &self.ui_prefs,
+                    &char_box,
+                    &allowed,
+                    &self.gpu_chars.fonts,
+                    now_s,
+                );
+            }
+        }
 
         self.bubble_frame = if self.active_remind.is_none() {
             self.bubble
@@ -1169,14 +1250,7 @@ impl PetRuntime {
                         RemindKind::Todo => if is_en { "To-Do" } else { "할 일" }.to_string(),
                     }
                 };
-                let memo_text = if rm.event.kind == RemindKind::Todo
-                    && !rm.event.memo.is_empty()
-                    && rm.event.left_count > 1
-                {
-                    format!("{} +{}", rm.event.memo, rm.event.left_count - 1)
-                } else {
-                    rm.event.memo.clone()
-                };
+                let memo_text = Self::format_remind_memo(&rm.event);
                 let header = if memo_text.is_empty() {
                     title
                 } else {
@@ -1189,13 +1263,32 @@ impl PetRuntime {
                 } else {
                     "눌러서 닫기"
                 };
-                let has_bubble = !memo_text.is_empty();
-                let body = if memo_text.is_empty() {
-                    header.as_str()
+                let custom_style_owned: Option<ResolvedBubbleStyle>;
+                let (has_bubble, body) = if let Some(ref display) = rm.before_display_text {
+                    let style_id = match (&rm.before_pool_key, &rm.before_raw_line) {
+                        (Some(pk), Some(raw)) => style_of_line(cfg, pk, raw),
+                        _ => String::new(),
+                    };
+                    custom_style_owned = if style_id.is_empty() {
+                        None
+                    } else {
+                        Some(ResolvedBubbleStyle::resolve(
+                            cfg,
+                            &style_id,
+                            &self.ui_prefs.bubble_theme,
+                        ))
+                    };
+                    (true, display.as_str())
                 } else {
-                    memo_text.as_str()
+                    custom_style_owned = None;
+                    let hb = !memo_text.is_empty();
+                    let b = if memo_text.is_empty() {
+                        header.as_str()
+                    } else {
+                        memo_text.as_str()
+                    };
+                    (hb, b)
                 };
-                let style_opt: Option<&ResolvedBubbleStyle> = None;
                 let (sprite, pad_l, pad_t) = rasterize_remind_badge(
                     kind_s,
                     &header,
@@ -1203,7 +1296,7 @@ impl PetRuntime {
                     footer_left,
                     &rm.event.slot_hhmm,
                     has_bubble,
-                    style_opt,
+                    custom_style_owned.as_ref(),
                     &self.gpu_chars.fonts,
                     dpr,
                 );
