@@ -77,6 +77,7 @@ pub struct GlobalMenuState<'a> {
     pub characters: &'a [String],
     pub pets: &'a [PetMenuSnapshot],
     pub pets_disabled: bool,
+    pub attach_to_taskbar: bool,
     pub ghost: bool,
     pub launch_at_login: bool,
     pub react: &'a crate::config::ReactPrefs,
@@ -87,6 +88,7 @@ pub struct GlobalMenuState<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TrayAction {
     TogglePetsDisabled,
+    ToggleAttachTaskbar,
     SpawnCharacter(String),
     GatherAll,
     ToggleGhost,
@@ -421,6 +423,7 @@ pub fn rgba_to_hicon(width: u32, height: u32, rgba: &[u8]) -> Result<HICON, Stri
 /// Localized menu strings (`en`, `ko`, `ja`, `zh`). Templates use `{n}` as a number placeholder.
 pub struct MenuLabels {
     pets_disabled: &'static str,
+    attach_taskbar: &'static str,
     spawn_char: &'static str,
     none: &'static str,
     pet_quick: &'static str,
@@ -501,6 +504,12 @@ pub fn menu_labels(lang: &str) -> MenuLabels {
             "활성 펫 비활성화 (일시 중지)",
             "アクティブなペットを無効化",
             "停用啟用中的寵物",
+        ),
+        attach_taskbar: p(
+            "Attach to Taskbar",
+            "작업 표시줄에 붙이기",
+            "タスクバーに固定",
+            "吸附到工作列",
         ),
         spawn_char: p("Spawn Character", "캐릭터 띄우기", "キャラクターを表示", "顯示角色"),
         none: p("(None)", "(없음)", "（なし）", "（無）"),
@@ -854,9 +863,11 @@ fn build_global_menu(
 ) -> Option<MenuGuard> {
     let menu = MenuGuard::new()?;
 
-    // Rust-only quick pause toggle
+    // Rust-only quick pause & taskbar dock toggles
     let id = push_action(actions, 0, TrayAction::TogglePetsDisabled);
     append_item(&menu, id, labels.pets_disabled, state.pets_disabled);
+    let id = push_action(actions, 0, TrayAction::ToggleAttachTaskbar);
+    append_item(&menu, id, labels.attach_taskbar, state.attach_to_taskbar);
     append_separator(&menu);
 
     // Spawn Character
@@ -1183,6 +1194,7 @@ mod tests {
             characters: &chars,
             pets: &pets,
             pets_disabled: false,
+            attach_to_taskbar: false,
             ghost: false,
             launch_at_login: false,
             react: &react,
@@ -1193,21 +1205,22 @@ mod tests {
         let menu = build_global_menu(&state, &labels, &mut table).expect("global menu");
         drop(menu);
 
-        // Quick disable toggle sits at index 1, followed by Spawn entries.
+        // Quick disable & attach toggles sit at indices 1..2, followed by Spawn entries.
         assert_eq!(action_from_cmd_id(1, &table), Some(TrayAction::TogglePetsDisabled));
+        assert_eq!(action_from_cmd_id(2, &table), Some(TrayAction::ToggleAttachTaskbar));
         assert_eq!(
-            action_from_cmd_id(2, &table),
+            action_from_cmd_id(3, &table),
             Some(TrayAction::SpawnCharacter("AlphaPet".to_string()))
         );
         assert_eq!(
-            action_from_cmd_id(3, &table),
+            action_from_cmd_id(4, &table),
             Some(TrayAction::SpawnCharacter("BetaPet".to_string()))
         );
 
         // Per-pet blocks are wrapped and contiguous, in order.
         let n1 = pet_actions(&pets[0]).len();
         let n2 = pet_actions(&pets[1]).len();
-        let first = 3 + 1;
+        let first = 4 + 1;
         assert_eq!(
             action_from_cmd_id(first as u32, &table),
             Some(TrayAction::PetQuick {
@@ -1272,6 +1285,7 @@ mod tests {
             characters: &chars,
             pets: &pets,
             pets_disabled: true,
+            attach_to_taskbar: true,
             ghost: true,
             launch_at_login: true,
             react: &react,
@@ -1315,6 +1329,7 @@ mod tests {
         let en = menu_labels("en");
         for lang in ["ko-KR", "ja", "zh-TW"] {
             let l = menu_labels(lang);
+            assert_ne!(l.attach_taskbar, en.attach_taskbar);
             assert_ne!(l.spawn_char, en.spawn_char);
             assert_ne!(l.pet_quick, en.pet_quick);
             assert_ne!(l.reload, en.reload);

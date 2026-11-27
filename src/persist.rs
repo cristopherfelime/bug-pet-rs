@@ -1,6 +1,7 @@
 use crate::config::{AppState, PetState, ReactPrefs, UiPrefs};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -360,6 +361,73 @@ impl StatePersister {
             let root = ensure_obj(doc);
             let local = ensure_obj(root.entry(LOCAL_KEY.to_string()).or_insert_with(|| json!({})));
             local.insert("petsDisabled".to_string(), json!(disabled));
+        });
+    }
+
+    #[allow(dead_code)]
+    pub fn attach_to_taskbar(&self) -> bool {
+        self.doc
+            .get(LOCAL_KEY)
+            .and_then(|v| v.get("attachToTaskbar"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    #[allow(dead_code)]
+    pub fn patch_attach_to_taskbar(&mut self, attach: bool) {
+        self.record_patch(|doc| {
+            let root = ensure_obj(doc);
+            let local = ensure_obj(root.entry(LOCAL_KEY.to_string()).or_insert_with(|| json!({})));
+            local.insert("attachToTaskbar".to_string(), json!(attach));
+        });
+    }
+
+    #[allow(dead_code)]
+    pub fn taskbar_offsets(&self) -> HashMap<String, f64> {
+        let mut out = HashMap::new();
+        let Some(map) = self
+            .doc
+            .get(LOCAL_KEY)
+            .and_then(|v| v.get("taskbarOffsets"))
+            .and_then(|v| v.as_object())
+        else {
+            return out;
+        };
+        for (k, v) in map {
+            if let Some(f) = v.as_f64() {
+                if f.is_finite() {
+                    out.insert(k.clone(), f);
+                }
+            }
+        }
+        out
+    }
+
+    #[allow(dead_code)]
+    pub fn patch_taskbar_offset(&mut self, pet_id: &str, offset_dip: f64) {
+        let rounded = (offset_dip * 10.0).round() / 10.0;
+        self.record_patch(|doc| {
+            let root = ensure_obj(doc);
+            let local = ensure_obj(root.entry(LOCAL_KEY.to_string()).or_insert_with(|| json!({})));
+            let offs = ensure_obj(
+                local
+                    .entry("taskbarOffsets".to_string())
+                    .or_insert_with(|| json!({})),
+            );
+            offs.insert(pet_id.to_string(), json!(rounded));
+        });
+    }
+
+    #[allow(dead_code)]
+    pub fn remove_taskbar_offset(&mut self, pet_id: &str) {
+        self.record_patch(|doc| {
+            if let Some(offs) = doc
+                .get_mut(LOCAL_KEY)
+                .and_then(|v| v.get_mut("taskbarOffsets"))
+                .and_then(|v| v.as_object_mut())
+            {
+                offs.remove(pet_id);
+            }
         });
     }
 
@@ -1132,6 +1200,47 @@ mod tests {
         assert!(from_sidecar);
         assert_eq!(s_fresh.pets[0].x, 77.0);
         assert!(p2.pets_disabled());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attach_to_taskbar_and_offsets_survive_source_reload() {
+        let dir = temp_test_dir("attach-tb");
+        let source = dir.join("source.json");
+        let target = dir.join("appdata").join("state.json");
+        let src_v1 = source_json(10.0, "v1");
+        fs::write(&source, &src_v1).unwrap();
+
+        let (_s, mut p, _) = load_synced_state(&source, true, Some(target.clone())).unwrap();
+        assert!(!p.attach_to_taskbar());
+        assert!(p.taskbar_offsets().is_empty());
+
+        p.patch_attach_to_taskbar(true);
+        p.patch_taskbar_offset("pet1", 12.34);
+        p.patch_taskbar_offset("pet2", -4.56);
+        p.remove_taskbar_offset("pet2");
+        p.flush().unwrap();
+        assert!(p.attach_to_taskbar());
+        assert_eq!(p.taskbar_offsets().get("pet1").copied(), Some(12.3));
+        assert!(!p.taskbar_offsets().contains_key("pet2"));
+        assert_eq!(fs::read_to_string(&source).unwrap(), src_v1);
+
+        let src_v2 = source_json(88.0, "v2-updated-in-source");
+        fs::write(&source, &src_v2).unwrap();
+        let s_reloaded = p.reload_from_source().unwrap();
+        assert_eq!(s_reloaded.pets[0].x, 88.0);
+        assert!(p.attach_to_taskbar());
+        assert_eq!(p.taskbar_offsets().get("pet1").copied(), Some(12.3));
+        p.flush().unwrap();
+        drop(p);
+
+        let (s_fresh, p2, from_sidecar) =
+            load_synced_state(&source, true, Some(target.clone())).unwrap();
+        assert!(from_sidecar);
+        assert_eq!(s_fresh.pets[0].x, 88.0);
+        assert!(p2.attach_to_taskbar());
+        assert_eq!(p2.taskbar_offsets().get("pet1").copied(), Some(12.3));
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -11,6 +11,7 @@ use std::rc::Rc;
 use std::time::Instant;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
 };
@@ -25,10 +26,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowLongPtrW, LoadCursorW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, GetClassNameW, GetCursorPos,
+    GetWindow, GetWindowLongPtrW, GetWindowRect, IsWindow, IsWindowVisible, LoadCursorW,
     PostQuitMessage, RegisterClassExW, SetCursor, SetForegroundWindow, SetLayeredWindowAttributes,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE, GWLP_USERDATA, HTCLIENT,
-    HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_HAND, LWA_ALPHA, SWP_FRAMECHANGED,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE, GWLP_USERDATA, GW_HWNDPREV,
+    HTCLIENT, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_HAND, LWA_ALPHA, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
     WA_INACTIVE, WINDOW_EX_STYLE, WM_ACTIVATE, WM_CAPTURECHANGED, WM_CLOSE, WM_INPUT,
     WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONUP, WM_SETCURSOR,
@@ -165,21 +167,32 @@ pub fn pick_monitor_for_point(
     }
 }
 
-pub fn pick_monitor_for_phys_point(px: i32, py: i32, monitors: &[MonitorMetrics]) -> MonitorMetrics {
-    if let Some(m) = monitors.iter().find(|m| {
+pub fn pick_monitor_idx_for_phys_point(px: i32, py: i32, monitors: &[MonitorMetrics]) -> usize {
+    if let Some((i, _)) = monitors.iter().enumerate().find(|(_, m)| {
         px >= m.phys_left
             && px < m.phys_left + m.phys_width
             && py >= m.phys_top
             && py < m.phys_top + m.phys_height
     }) {
-        return *m;
+        return i;
     }
     monitors
         .iter()
-        .find(|m| m.is_primary)
-        .or_else(|| monitors.first())
-        .copied()
-        .unwrap_or(MonitorMetrics {
+        .enumerate()
+        .min_by_key(|(_, m)| {
+            let cx = m.phys_left as i64 + (m.phys_width as i64) / 2;
+            let cy = m.phys_top as i64 + (m.phys_height as i64) / 2;
+            let dx = px as i64 - cx;
+            let dy = py as i64 - cy;
+            dx * dx + dy * dy
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+pub fn pick_monitor_for_phys_point(px: i32, py: i32, monitors: &[MonitorMetrics]) -> MonitorMetrics {
+    if monitors.is_empty() {
+        return MonitorMetrics {
             phys_left: 0,
             phys_top: 0,
             phys_width: 1920,
@@ -191,7 +204,9 @@ pub fn pick_monitor_for_phys_point(px: i32, py: i32, monitors: &[MonitorMetrics]
             dpi: 96,
             dpr: 1.0,
             is_primary: true,
-        })
+        };
+    }
+    monitors[pick_monitor_idx_for_phys_point(px, py, monitors)]
 }
 
 /// Converts Electron virtual DIP coordinates for a pet's tight window to physical Win32 pixels.
@@ -251,6 +266,7 @@ pub struct PetWindow {
     pub is_transparent: bool,
     pub tracking_leave: bool,
     pub overlay: Option<OverlayWindow>,
+    pub smooth_y_px: Option<f64>,
 }
 
 pub struct SharedAppEvents {
@@ -458,6 +474,7 @@ pub fn create_pet_window(
         is_transparent: initial_transparent,
         tracking_leave: false,
         overlay: None,
+        smooth_y_px: None,
     })
 }
 
@@ -690,6 +707,7 @@ pub fn resize_pet_window_to_size(
 
     pw.surface.resize(gpu, new_w as u32, new_h as u32)?;
     pw.rect_px = (new_x, new_y, new_w, new_h);
+    pw.smooth_y_px = None;
     unsafe {
         let _ = SetWindowPos(
             pw.hwnd,
@@ -702,6 +720,222 @@ pub fn resize_pet_window_to_size(
         );
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskbarSlice {
+    pub hwnd: isize,
+    pub monitor_idx: usize,
+    pub top_px: i32,
+    pub mon_bottom_px: i32,
+    pub is_shown: bool,
+}
+
+pub fn resolve_taskbar_top_px(rc: RECT, visible: bool, mon_top: i32, mon_bottom: i32) -> (i32, bool) {
+    if !visible {
+        return (mon_bottom, false);
+    }
+    let max_tb_h = ((mon_bottom - mon_top) / 3).max(200);
+    if rc.top >= mon_bottom - 4 {
+        return (mon_bottom, false);
+    }
+    if rc.bottom >= mon_bottom - 16 && rc.top >= mon_bottom - max_tb_h {
+        return (rc.top.clamp(mon_bottom - max_tb_h, mon_bottom), true);
+    }
+    (mon_bottom, false)
+}
+
+unsafe extern "system" fn enum_taskbar_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let mut buf = [0u16; 64];
+    let len = GetClassNameW(hwnd, &mut buf);
+    if len > 0 {
+        let cls = String::from_utf16_lossy(&buf[..len as usize]);
+        if cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd" {
+            let list = &mut *(lparam.0 as *mut Vec<HWND>);
+            list.push(hwnd);
+        }
+    }
+    BOOL(1)
+}
+
+pub struct TaskbarTracker {
+    cached_hwnds: Vec<HWND>,
+    last_scan: Option<Instant>,
+}
+
+impl TaskbarTracker {
+    pub fn new() -> Self {
+        Self {
+            cached_hwnds: Vec::new(),
+            last_scan: None,
+        }
+    }
+
+    fn refresh_if_needed(&mut self, now: Instant) {
+        let stale = self
+            .last_scan
+            .is_none_or(|t| now.saturating_duration_since(t) >= std::time::Duration::from_secs(2));
+        let invalid = self.cached_hwnds.is_empty()
+            || self
+                .cached_hwnds
+                .iter()
+                .any(|h| !unsafe { IsWindow(*h).as_bool() });
+        if !stale && !invalid {
+            return;
+        }
+        self.cached_hwnds.clear();
+        unsafe {
+            let _ = EnumWindows(
+                Some(enum_taskbar_proc),
+                LPARAM(&mut self.cached_hwnds as *mut Vec<HWND> as isize),
+            );
+        }
+        self.last_scan = Some(now);
+    }
+
+    pub fn sample(&mut self, monitors: &[MonitorMetrics], now: Instant) -> Vec<TaskbarSlice> {
+        self.refresh_if_needed(now);
+        let mut out = Vec::with_capacity(self.cached_hwnds.len());
+        if monitors.is_empty() {
+            return out;
+        }
+        for &h in &self.cached_hwnds {
+            let visible = unsafe { IsWindowVisible(h).as_bool() };
+            let mut rc = RECT::default();
+            let got_rect = unsafe {
+                DwmGetWindowAttribute(
+                    h,
+                    DWMWA_EXTENDED_FRAME_BOUNDS,
+                    &mut rc as *mut RECT as *mut _,
+                    size_of::<RECT>() as u32,
+                )
+            }
+            .is_ok()
+                || unsafe { GetWindowRect(h, &mut rc).is_ok() };
+            if !got_rect {
+                continue;
+            }
+            let cx = rc.left + (rc.right - rc.left) / 2;
+            let cy = (rc.top + rc.bottom) / 2;
+            let mon_idx = pick_monitor_idx_for_phys_point(cx, cy, monitors);
+            let mon = &monitors[mon_idx];
+            let mon_bottom = mon.phys_top + mon.phys_height;
+            let (top_px, is_shown) = resolve_taskbar_top_px(rc, visible, mon.phys_top, mon_bottom);
+            out.push(TaskbarSlice {
+                hwnd: h.0 as isize,
+                monitor_idx: mon_idx,
+                top_px,
+                mon_bottom_px: mon_bottom,
+                is_shown,
+            });
+        }
+        out
+    }
+}
+
+pub fn monitor_taskbar_top_px(
+    slices: &[TaskbarSlice],
+    monitor_idx: usize,
+    mon: &MonitorMetrics,
+) -> (i32, Option<TaskbarSlice>) {
+    if let Some(sl) = slices.iter().find(|s| s.monitor_idx == monitor_idx) {
+        (sl.top_px, Some(*sl))
+    } else {
+        (mon.work_top + mon.work_height, None)
+    }
+}
+
+pub fn is_window_above(candidate: HWND, reference: HWND) -> bool {
+    if candidate.0.is_null() || reference.0.is_null() || candidate == reference {
+        return false;
+    }
+    let mut cur = reference;
+    for _ in 0..256 {
+        let Ok(prev) = (unsafe { GetWindow(cur, GW_HWNDPREV) }) else {
+            break;
+        };
+        if prev.0.is_null() {
+            break;
+        }
+        if prev == candidate {
+            return true;
+        }
+        cur = prev;
+    }
+    false
+}
+
+pub fn ensure_pet_above_taskbar(pw: &PetWindow, tb_hwnd: HWND) {
+    if tb_hwnd.0.is_null() {
+        return;
+    }
+    if is_window_above(tb_hwnd, pw.hwnd) {
+        unsafe {
+            let _ = SetWindowPos(
+                pw.hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+    if let Some(ref ov) = pw.overlay {
+        if ov.visible && (is_window_above(tb_hwnd, ov.hwnd) || is_window_above(pw.hwnd, ov.hwnd)) {
+            unsafe {
+                let _ = SetWindowPos(
+                    ov.hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+}
+
+pub fn pet_core_bottom_px(
+    pw_rect_y: i32,
+    win_h_dip: f64,
+    geom_size_dip: f64,
+    dpr: f64,
+) -> f64 {
+    let off_y_dip = (win_h_dip - geom_size_dip) * 0.5;
+    pw_rect_y as f64 + (off_y_dip + geom_size_dip) * dpr
+}
+
+pub fn pet_win_y_for_taskbar_px(
+    taskbar_top_px: i32,
+    offset_dip: f64,
+    win_h_dip: f64,
+    geom_size_dip: f64,
+    dpr: f64,
+) -> f64 {
+    let off_y_dip = (win_h_dip - geom_size_dip) * 0.5;
+    taskbar_top_px as f64 + (offset_dip - geom_size_dip - off_y_dip) * dpr
+}
+
+pub fn initial_taskbar_offset_dip(core_bottom_px: f64, taskbar_top_px: i32, dpr: f64) -> f64 {
+    let raw = (core_bottom_px - taskbar_top_px as f64) / dpr.max(0.5);
+    if (-120.0..=120.0).contains(&raw) {
+        (raw * 10.0).round() / 10.0
+    } else {
+        0.0
+    }
+}
+
+pub fn step_smooth_y(current: f64, target: f64, dt_s: f64) -> f64 {
+    if (target - current).abs() <= 0.75 {
+        target
+    } else {
+        let alpha = 1.0 - (-dt_s.clamp(0.001, 0.05) * 32.0).exp();
+        current + (target - current) * alpha
+    }
 }
 
 pub fn sync_click_through(shared: &Rc<RefCell<SharedAppEvents>>) {
@@ -1271,5 +1505,62 @@ mod tests {
         unsafe {
             let _ = DestroyWindow(hwnd);
         }
+    }
+
+    #[test]
+    fn resolve_taskbar_top_handles_shown_sliding_and_hidden() {
+        let m_top = 0;
+        let m_bot = 1800;
+        assert_eq!(
+            resolve_taskbar_top_px(RECT { left: 0, top: 1704, right: 2880, bottom: 1800 }, true, m_top, m_bot),
+            (1704, true)
+        );
+        assert_eq!(
+            resolve_taskbar_top_px(RECT { left: 0, top: 1752, right: 2880, bottom: 1848 }, true, m_top, m_bot),
+            (1752, true)
+        );
+        assert_eq!(
+            resolve_taskbar_top_px(RECT { left: 0, top: 1798, right: 2880, bottom: 1894 }, true, m_top, m_bot),
+            (1800, false)
+        );
+        assert_eq!(
+            resolve_taskbar_top_px(RECT { left: 0, top: 1802, right: 2880, bottom: 1898 }, true, m_top, m_bot),
+            (1800, false)
+        );
+        assert_eq!(
+            resolve_taskbar_top_px(RECT { left: 0, top: 1704, right: 2880, bottom: 1800 }, false, m_top, m_bot),
+            (1800, false)
+        );
+    }
+
+    #[test]
+    fn taskbar_offset_preserves_dangling_paws_and_snaps_midscreen_pets() {
+        let dpr = 2.0;
+        let win_h = 378.0;
+        let geom_s = 180.0;
+        let tb_shown = 1704;
+        let tb_hidden = 1800;
+
+        // Core bottom sits 18 DIP below taskbar top (dangling paws)
+        let win_y = pet_win_y_for_taskbar_px(tb_shown, 18.0, win_h, geom_s, dpr);
+        let core_b = pet_core_bottom_px(win_y.round() as i32, win_h, geom_s, dpr);
+        let off = initial_taskbar_offset_dip(core_b, tb_shown, dpr);
+        assert!((off - 18.0).abs() <= 0.6);
+
+        // Moving taskbar down 96 px (shown -> hidden) shifts window down by exactly 96 px
+        let win_y_hidden = pet_win_y_for_taskbar_px(tb_hidden, 18.0, win_h, geom_s, dpr);
+        assert!((win_y_hidden - win_y - 96.0).abs() < 1e-6);
+
+        // Far mid-screen pet snaps cleanly to 0.0 offset
+        assert_eq!(initial_taskbar_offset_dip(900.0, tb_shown, dpr), 0.0);
+    }
+
+    #[test]
+    fn step_smooth_y_converges_cleanly() {
+        let mut y = 1146.0;
+        for _ in 0..30 {
+            y = step_smooth_y(y, 1242.0, 0.016);
+        }
+        assert_eq!(y, 1242.0);
     }
 }

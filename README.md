@@ -71,6 +71,7 @@ Do not commit or share key material.
 - **Drag** a pet to move it, **pet** it for particles and reactions, and use the **radial wheel** for quick actions.
 - **Tray icon (right-click or left-click)**:
   - *Disable Active Pets* – Rust-exclusive quick toggle that hides all pet windows & overlays and pauses GPU rendering, WASAPI audio capture, typing hooks, and reminders until toggled back on (saved locally under `_bugPetRsLocal` in `%APPDATA%\bug-pet-rs\state.json`, surviving reboots and BUG Clicker syncs)
+  - *Attach to Taskbar* – Rust-exclusive toggle that docks pets to the Windows taskbar (tracking auto-hide slide up/down smoothly across monitors via `DWMWA_EXTENDED_FRAME_BOUNDS`), preserves custom vertical overhang offsets, and keeps attached pets above the taskbar when clicked
   - *Spawn Character* – add any installed character
   - *Pet Quick Settings* – one submenu per active pet: size (±10 px and presets), flip, lock position, click-through, always on top, mute, react to music / typing, OBS key background (transparent / green / blue / magenta), rig-part toggles, close pet
   - *Quick Settings* – music sensitivity, sound mode, audio gain, typing cadence, rest when idle and timeout, bubble font size, lite / reduce motion, language
