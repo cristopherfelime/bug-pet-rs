@@ -8,14 +8,24 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::rc::Rc;
-use std::time::Instant;
-use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
-use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+use windows::core::{w, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{
+    CloseHandle, BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
+use windows::Win32::Graphics::Dwm::{
+    DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, HDC, HMONITOR, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST,
+};
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::HiDpi::{
     GetDpiForMonitor, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     MDT_EFFECTIVE_DPI,
@@ -23,17 +33,23 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
 };
+use windows::Win32::UI::Shell::{
+    AppVisibility, IAppVisibility, SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA,
+};
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
+static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, GetClassNameW, GetCursorPos,
-    GetWindow, GetWindowLongPtrW, GetWindowRect, IsWindow, IsWindowVisible, LoadCursorW,
-    PostQuitMessage, RegisterClassExW, SetCursor, SetForegroundWindow, SetLayeredWindowAttributes,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE, GWLP_USERDATA, GW_HWNDPREV,
-    HTCLIENT, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_HAND, LWA_ALPHA, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
-    WA_INACTIVE, WINDOW_EX_STYLE, WM_ACTIVATE, WM_CAPTURECHANGED, WM_CLOSE, WM_INPUT,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONUP, WM_SETCURSOR,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, FindWindowExW, FindWindowW,
+    GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
+    GetWindowThreadProcessId, IsWindow, IsWindowVisible, LoadCursorW, PostQuitMessage,
+    RegisterClassExW, RegisterWindowMessageW, SetCursor, SetForegroundWindow,
+    SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE,
+    GWLP_USERDATA, GW_HWNDPREV, HTCLIENT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDC_ARROW,
+    IDC_HAND, LWA_ALPHA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, WA_INACTIVE, WINDOW_EX_STYLE,
+    WM_ACTIVATE, WM_CAPTURECHANGED, WM_CLOSE, WM_DISPLAYCHANGE, WM_INPUT, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE,
     WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
 };
@@ -244,6 +260,8 @@ pub enum PendingUiAction {
     },
     CloseRadial(String),
     DragEnded(String),
+    DisplayChanged,
+    TaskbarRecreated,
 }
 
 pub struct OverlayWindow {
@@ -267,6 +285,7 @@ pub struct PetWindow {
     pub tracking_leave: bool,
     pub overlay: Option<OverlayWindow>,
     pub smooth_y_px: Option<f64>,
+    pub z_retry_after: Option<Instant>,
 }
 
 pub struct SharedAppEvents {
@@ -332,6 +351,8 @@ pub fn register_window_class() -> Result<(), String> {
             return Err("RegisterClassExW failed".to_string());
         }
     }
+    let tb_msg = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+    TASKBAR_CREATED_MSG.store(tb_msg, Ordering::Relaxed);
     Ok(())
 }
 
@@ -475,6 +496,7 @@ pub fn create_pet_window(
         tracking_leave: false,
         overlay: None,
         smooth_y_px: None,
+        z_retry_after: None,
     })
 }
 
@@ -729,17 +751,28 @@ pub struct TaskbarSlice {
     pub top_px: i32,
     pub mon_bottom_px: i32,
     pub is_shown: bool,
+    pub is_primary: bool,
+    pub win_rect: (i32, i32, i32, i32),
+}
+
+pub fn choose_taskbar_rect(win_rc: Option<RECT>, dwm_rc: Option<RECT>) -> Option<RECT> {
+    let valid = |r: &RECT| r.right > r.left && r.bottom > r.top;
+    if let Some(r) = win_rc.filter(valid) {
+        Some(r)
+    } else {
+        dwm_rc.filter(valid)
+    }
 }
 
 pub fn resolve_taskbar_top_px(rc: RECT, visible: bool, mon_top: i32, mon_bottom: i32) -> (i32, bool) {
-    if !visible {
+    if !visible || rc.right <= rc.left || rc.bottom <= rc.top {
         return (mon_bottom, false);
     }
     let max_tb_h = ((mon_bottom - mon_top) / 3).max(200);
     if rc.top >= mon_bottom - 4 {
         return (mon_bottom, false);
     }
-    if rc.bottom >= mon_bottom - 16 && rc.top >= mon_bottom - max_tb_h {
+    if rc.bottom >= mon_bottom - 48 && rc.top >= mon_bottom - max_tb_h {
         return (rc.top.clamp(mon_bottom - max_tb_h, mon_bottom), true);
     }
     (mon_bottom, false)
@@ -751,16 +784,162 @@ unsafe extern "system" fn enum_taskbar_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
     if len > 0 {
         let cls = String::from_utf16_lossy(&buf[..len as usize]);
         if cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd" {
-            let list = &mut *(lparam.0 as *mut Vec<HWND>);
-            list.push(hwnd);
+            let list = &mut *(lparam.0 as *mut Vec<(HWND, bool)>);
+            list.push((hwnd, cls == "Shell_TrayWnd"));
         }
     }
     BOOL(1)
 }
 
+fn monitor_idx_for_hwnd(h: HWND, rc: RECT, monitors: &[MonitorMetrics]) -> usize {
+    let hmon = unsafe { MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) };
+    if !hmon.0.is_null() {
+        let mut mi = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetMonitorInfoW(hmon, &mut mi).as_bool() } {
+            let mw = mi.rcMonitor.right - mi.rcMonitor.left;
+            let mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
+            if let Some((i, _)) = monitors.iter().enumerate().find(|(_, m)| {
+                m.phys_left == mi.rcMonitor.left
+                    && m.phys_top == mi.rcMonitor.top
+                    && m.phys_width == mw
+                    && m.phys_height == mh
+            }) {
+                return i;
+            }
+        }
+    }
+    let cx = rc.left + (rc.right - rc.left) / 2;
+    let cy = rc.top + (rc.bottom - rc.top) / 2;
+    pick_monitor_idx_for_phys_point(cx, cy, monitors)
+}
+
+pub fn is_shell_taskbar_flyout_exe(exe_name_lower: &str) -> bool {
+    matches!(
+        exe_name_lower,
+        "startmenuexperiencehost.exe"
+            | "searchhost.exe"
+            | "searchapp.exe"
+            | "shellhost.exe"
+            | "shellexperiencehost.exe"
+    )
+}
+
+pub fn merge_taskbar_hwnd(list: &mut Vec<(HWND, bool)>, hwnd: HWND, is_primary: bool) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    if let Some((_, existing_pri)) = list.iter_mut().find(|(h, _)| *h == hwnd) {
+        *existing_pri |= is_primary;
+    } else {
+        list.push((hwnd, is_primary));
+    }
+}
+
+pub fn estimate_shown_taskbar_top_px(
+    mon_top: i32,
+    mon_bottom: i32,
+    dpr: f64,
+    last_shown_h: Option<i32>,
+    raw_rc: RECT,
+    appbar_h: Option<i32>,
+) -> i32 {
+    let max_tb_h = ((mon_bottom - mon_top) / 3).max(200);
+    let raw_h = raw_rc.bottom - raw_rc.top;
+    let fallback_h = (48.0 * dpr.max(1.0)).round() as i32;
+    let chosen_h = [last_shown_h, appbar_h, Some(raw_h)]
+        .into_iter()
+        .flatten()
+        .find(|&h| (24..=max_tb_h).contains(&h))
+        .unwrap_or(fallback_h);
+    (mon_bottom - chosen_h).clamp(mon_bottom - max_tb_h, mon_bottom)
+}
+
+fn query_primary_appbar_height_px(tb_hwnd: HWND) -> Option<i32> {
+    if tb_hwnd.0.is_null() {
+        return None;
+    }
+    let mut abd = APPBARDATA {
+        cbSize: size_of::<APPBARDATA>() as u32,
+        hWnd: tb_hwnd,
+        ..Default::default()
+    };
+    let ok = unsafe { SHAppBarMessage(ABM_GETTASKBARPOS, &mut abd) };
+    if ok != 0 {
+        let h = abd.rc.bottom - abd.rc.top;
+        if h > 0 {
+            return Some(h);
+        }
+    }
+    None
+}
+
+fn hwnd_process_basename_lower(hwnd: HWND) -> Option<String> {
+    let mut pid: u32 = 0;
+    unsafe {
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    }
+    if pid == 0 {
+        return None;
+    }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let mut buf = [0u16; 260];
+    let mut len = buf.len() as u32;
+    let ok = unsafe {
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .is_ok();
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    if !ok || len == 0 {
+        return None;
+    }
+    let full = String::from_utf16_lossy(&buf[..len as usize]);
+    let base = full.rsplit(['\\', '/']).next().unwrap_or(&full);
+    Some(base.to_ascii_lowercase())
+}
+
+fn is_hwnd_uncloaked_visible(hwnd: HWND) -> bool {
+    if hwnd.0.is_null() || !unsafe { IsWindowVisible(hwnd).as_bool() } {
+        return false;
+    }
+    let mut cloaked: u32 = 0;
+    if unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut _,
+            size_of::<u32>() as u32,
+        )
+    }
+    .is_ok()
+        && cloaked != 0
+    {
+        return false;
+    }
+    let mut rc = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut rc) }.is_ok() && rc.right > rc.left && rc.bottom > rc.top
+}
+
 pub struct TaskbarTracker {
-    cached_hwnds: Vec<HWND>,
+    cached_hwnds: Vec<(HWND, bool)>,
     last_scan: Option<Instant>,
+    app_visibility: Option<IAppVisibility>,
+    app_vis_attempted: bool,
+    last_launcher_check: Option<Instant>,
+    last_launcher_visible: bool,
+    last_fg_hwnd: isize,
+    last_fg_is_flyout: bool,
+    last_shown_heights: HashMap<usize, i32>,
+    last_flyout_active: bool,
 }
 
 impl TaskbarTracker {
@@ -768,27 +947,119 @@ impl TaskbarTracker {
         Self {
             cached_hwnds: Vec::new(),
             last_scan: None,
+            app_visibility: None,
+            app_vis_attempted: false,
+            last_launcher_check: None,
+            last_launcher_visible: false,
+            last_fg_hwnd: 0,
+            last_fg_is_flyout: false,
+            last_shown_heights: HashMap::new(),
+            last_flyout_active: false,
         }
     }
 
+    pub fn invalidate(&mut self) {
+        self.cached_hwnds.clear();
+        self.last_scan = None;
+        self.last_shown_heights.clear();
+        self.last_launcher_check = None;
+        self.last_fg_hwnd = 0;
+        self.last_fg_is_flyout = false;
+    }
+
+    pub fn shell_flyout_active(&self) -> bool {
+        self.last_flyout_active
+    }
+
+    pub fn launcher_visible(&self) -> bool {
+        self.last_launcher_visible
+    }
+
+    fn detect_shell_flyout_monitor(
+        &mut self,
+        monitors: &[MonitorMetrics],
+        now: Instant,
+    ) -> (Option<usize>, bool) {
+        let mut fg_mon = None;
+        let fg = unsafe { GetForegroundWindow() };
+        if !fg.0.is_null() {
+            let fg_id = fg.0 as isize;
+            if fg_id != self.last_fg_hwnd {
+                self.last_fg_hwnd = fg_id;
+                self.last_fg_is_flyout = hwnd_process_basename_lower(fg)
+                    .as_deref()
+                    .is_some_and(is_shell_taskbar_flyout_exe);
+            }
+            if self.last_fg_is_flyout && is_hwnd_uncloaked_visible(fg) {
+                let mut fg_rc = RECT::default();
+                if unsafe { GetWindowRect(fg, &mut fg_rc) }.is_ok() {
+                    fg_mon = Some(monitor_idx_for_hwnd(fg, fg_rc, monitors));
+                }
+            }
+        } else {
+            self.last_fg_hwnd = 0;
+            self.last_fg_is_flyout = false;
+        }
+
+        if !self.app_vis_attempted {
+            self.app_vis_attempted = true;
+            self.app_visibility = unsafe { CoCreateInstance(&AppVisibility, None, CLSCTX_ALL) }.ok();
+        }
+        if self
+            .last_launcher_check
+            .is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_millis(100))
+        {
+            self.last_launcher_check = Some(now);
+            self.last_launcher_visible = self
+                .app_visibility
+                .as_ref()
+                .and_then(|av| unsafe { av.IsLauncherVisible() }.ok())
+                .is_some_and(|b| b.as_bool());
+        }
+
+        (fg_mon, self.last_launcher_visible)
+    }
+
     fn refresh_if_needed(&mut self, now: Instant) {
+        self.cached_hwnds
+            .retain(|(h, _)| unsafe { IsWindow(*h).as_bool() });
+        let has_primary = self.cached_hwnds.iter().any(|(_, pri)| *pri);
         let stale = self
             .last_scan
-            .is_none_or(|t| now.saturating_duration_since(t) >= std::time::Duration::from_secs(2));
-        let invalid = self.cached_hwnds.is_empty()
-            || self
-                .cached_hwnds
-                .iter()
-                .any(|h| !unsafe { IsWindow(*h).as_bool() });
-        if !stale && !invalid {
+            .is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_secs(2));
+        if !stale && !self.cached_hwnds.is_empty() && has_primary {
             return;
         }
-        self.cached_hwnds.clear();
+        if let Ok(primary) = unsafe { FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) } {
+            merge_taskbar_hwnd(&mut self.cached_hwnds, primary, true);
+        }
+        let mut prev = HWND::default();
+        for _ in 0..16 {
+            let Ok(next) = (unsafe {
+                FindWindowExW(
+                    HWND::default(),
+                    prev,
+                    w!("Shell_SecondaryTrayWnd"),
+                    PCWSTR::null(),
+                )
+            }) else {
+                break;
+            };
+            if next.0.is_null() || next == prev {
+                break;
+            }
+            merge_taskbar_hwnd(&mut self.cached_hwnds, next, false);
+            prev = next;
+        }
+        let mut discovered: Vec<(HWND, bool)> = Vec::new();
         unsafe {
             let _ = EnumWindows(
                 Some(enum_taskbar_proc),
-                LPARAM(&mut self.cached_hwnds as *mut Vec<HWND> as isize),
+                LPARAM(&mut discovered as *mut Vec<(HWND, bool)> as isize),
             );
+        }
+        for (h, pri) in discovered {
+            merge_taskbar_hwnd(&mut self.cached_hwnds, h, pri);
         }
         self.last_scan = Some(now);
     }
@@ -799,36 +1070,106 @@ impl TaskbarTracker {
         if monitors.is_empty() {
             return out;
         }
-        for &h in &self.cached_hwnds {
-            let visible = unsafe { IsWindowVisible(h).as_bool() };
-            let mut rc = RECT::default();
-            let got_rect = unsafe {
+        for &(h, is_primary) in &self.cached_hwnds {
+            let mut visible = unsafe { IsWindowVisible(h).as_bool() };
+            if visible {
+                let mut cloaked: u32 = 0;
+                if unsafe {
+                    DwmGetWindowAttribute(
+                        h,
+                        DWMWA_CLOAKED,
+                        &mut cloaked as *mut u32 as *mut _,
+                        size_of::<u32>() as u32,
+                    )
+                }
+                .is_ok()
+                    && cloaked != 0
+                {
+                    visible = false;
+                }
+            }
+            let mut win_rc_raw = RECT::default();
+            let win_rc = unsafe { GetWindowRect(h, &mut win_rc_raw) }
+                .is_ok()
+                .then_some(win_rc_raw);
+            let mut dwm_rc_raw = RECT::default();
+            let dwm_rc = unsafe {
                 DwmGetWindowAttribute(
                     h,
                     DWMWA_EXTENDED_FRAME_BOUNDS,
-                    &mut rc as *mut RECT as *mut _,
+                    &mut dwm_rc_raw as *mut RECT as *mut _,
                     size_of::<RECT>() as u32,
                 )
             }
             .is_ok()
-                || unsafe { GetWindowRect(h, &mut rc).is_ok() };
-            if !got_rect {
+            .then_some(dwm_rc_raw);
+            let Some(rc) = choose_taskbar_rect(win_rc, dwm_rc) else {
                 continue;
-            }
-            let cx = rc.left + (rc.right - rc.left) / 2;
-            let cy = (rc.top + rc.bottom) / 2;
-            let mon_idx = pick_monitor_idx_for_phys_point(cx, cy, monitors);
+            };
+            let mon_idx = monitor_idx_for_hwnd(h, rc, monitors);
             let mon = &monitors[mon_idx];
             let mon_bottom = mon.phys_top + mon.phys_height;
             let (top_px, is_shown) = resolve_taskbar_top_px(rc, visible, mon.phys_top, mon_bottom);
+            if is_shown {
+                let h_px = mon_bottom - top_px;
+                if h_px >= 24 {
+                    self.last_shown_heights.insert(mon_idx, h_px);
+                }
+            }
             out.push(TaskbarSlice {
                 hwnd: h.0 as isize,
                 monitor_idx: mon_idx,
                 top_px,
                 mon_bottom_px: mon_bottom,
                 is_shown,
+                is_primary,
+                win_rect: (rc.left, rc.top, rc.right, rc.bottom),
             });
         }
+
+        let (fg_mon, launcher_vis) = self.detect_shell_flyout_monitor(monitors, now);
+        self.last_flyout_active = fg_mon.is_some() || launcher_vis;
+        let forced_mon = fg_mon.or_else(|| {
+            if launcher_vis {
+                out.iter()
+                    .find(|s| s.is_primary)
+                    .map(|s| s.monitor_idx)
+                    .or_else(|| monitors.iter().position(|m| m.is_primary))
+                    .or(Some(0))
+            } else {
+                None
+            }
+        });
+        if let Some(target_mon) = forced_mon {
+            let last_h = self.last_shown_heights.get(&target_mon).copied();
+            for sl in &mut out {
+                if sl.monitor_idx == target_mon && !sl.is_shown {
+                    let mon = &monitors[sl.monitor_idx];
+                    let appbar_h = if sl.is_primary {
+                        query_primary_appbar_height_px(HWND(sl.hwnd as *mut _))
+                    } else {
+                        None
+                    };
+                    let raw_rc = RECT {
+                        left: sl.win_rect.0,
+                        top: sl.win_rect.1,
+                        right: sl.win_rect.2,
+                        bottom: sl.win_rect.3,
+                    };
+                    sl.top_px = estimate_shown_taskbar_top_px(
+                        mon.phys_top,
+                        sl.mon_bottom_px,
+                        mon.dpr,
+                        last_h,
+                        raw_rc,
+                        appbar_h,
+                    );
+                    sl.is_shown = true;
+                }
+            }
+        }
+
+        out.sort_by_key(|s| (s.monitor_idx, !s.is_shown, s.top_px, !s.is_primary, s.hwnd));
         out
     }
 }
@@ -838,7 +1179,11 @@ pub fn monitor_taskbar_top_px(
     monitor_idx: usize,
     mon: &MonitorMetrics,
 ) -> (i32, Option<TaskbarSlice>) {
-    if let Some(sl) = slices.iter().find(|s| s.monitor_idx == monitor_idx) {
+    if let Some(sl) = slices
+        .iter()
+        .filter(|s| s.monitor_idx == monitor_idx)
+        .min_by_key(|s| (!s.is_shown, s.top_px, !s.is_primary))
+    {
         (sl.top_px, Some(*sl))
     } else {
         (mon.work_top + mon.work_height, None)
@@ -850,7 +1195,7 @@ pub fn is_window_above(candidate: HWND, reference: HWND) -> bool {
         return false;
     }
     let mut cur = reference;
-    for _ in 0..256 {
+    for _ in 0..1024 {
         let Ok(prev) = (unsafe { GetWindow(cur, GW_HWNDPREV) }) else {
             break;
         };
@@ -865,38 +1210,71 @@ pub fn is_window_above(candidate: HWND, reference: HWND) -> bool {
     false
 }
 
-pub fn ensure_pet_above_taskbar(pw: &PetWindow, tb_hwnd: HWND) {
+pub fn ensure_pet_above_taskbar(
+    pw: &mut PetWindow,
+    tb_hwnd: HWND,
+    now: Instant,
+    force_now: bool,
+) -> bool {
     if tb_hwnd.0.is_null() {
-        return;
+        pw.z_retry_after = None;
+        return false;
     }
-    if is_window_above(tb_hwnd, pw.hwnd) {
-        unsafe {
-            let _ = SetWindowPos(
-                pw.hwnd,
-                HWND_TOPMOST,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
-        }
-    }
+    let pet_lost_topmost =
+        unsafe { (GetWindowLongPtrW(pw.hwnd, GWL_EXSTYLE) & (WS_EX_TOPMOST.0 as isize)) == 0 };
+    let pet_needs = pet_lost_topmost || is_window_above(tb_hwnd, pw.hwnd);
+
+    let mut ov_hwnd_to_raise: Option<HWND> = None;
     if let Some(ref ov) = pw.overlay {
-        if ov.visible && (is_window_above(tb_hwnd, ov.hwnd) || is_window_above(pw.hwnd, ov.hwnd)) {
-            unsafe {
-                let _ = SetWindowPos(
-                    ov.hwnd,
-                    HWND_TOPMOST,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                );
+        if ov.visible {
+            let ov_lost_topmost = unsafe {
+                (GetWindowLongPtrW(ov.hwnd, GWL_EXSTYLE) & (WS_EX_TOPMOST.0 as isize)) == 0
+            };
+            if ov_lost_topmost
+                || is_window_above(tb_hwnd, ov.hwnd)
+                || is_window_above(pw.hwnd, ov.hwnd)
+            {
+                ov_hwnd_to_raise = Some(ov.hwnd);
             }
         }
     }
+
+    if !pet_needs && ov_hwnd_to_raise.is_none() {
+        pw.z_retry_after = None;
+        return false;
+    }
+    if !force_now && pw.z_retry_after.is_some_and(|t| now < t) {
+        return false;
+    }
+
+    let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+    if pet_needs {
+        unsafe {
+            let _ = SetWindowPos(pw.hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+        }
+        if is_window_above(tb_hwnd, pw.hwnd) {
+            unsafe {
+                let _ = SetWindowPos(pw.hwnd, HWND_TOP, 0, 0, 0, 0, flags);
+            }
+        }
+    }
+    if let Some(ov_hwnd) = ov_hwnd_to_raise {
+        unsafe {
+            let _ = SetWindowPos(ov_hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+        }
+        if is_window_above(tb_hwnd, ov_hwnd) || is_window_above(pw.hwnd, ov_hwnd) {
+            unsafe {
+                let _ = SetWindowPos(ov_hwnd, HWND_TOP, 0, 0, 0, 0, flags);
+            }
+        }
+    }
+
+    if is_window_above(tb_hwnd, pw.hwnd) {
+        pw.z_retry_after = Some(now + Duration::from_millis(250));
+    } else {
+        pw.z_retry_after = None;
+    }
+    true
 }
 
 pub fn pet_core_bottom_px(
@@ -1055,6 +1433,23 @@ unsafe extern "system" fn tray_host_wnd_proc(
             }
         }
         return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+
+    if msg == WM_DISPLAYCHANGE || msg == WM_SETTINGCHANGE {
+        if let Ok(mut st) = shared.try_borrow_mut() {
+            if !matches!(st.pending_actions.last(), Some(PendingUiAction::DisplayChanged)) {
+                st.pending_actions.push(PendingUiAction::DisplayChanged);
+            }
+        }
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+
+    let tb_msg = TASKBAR_CREATED_MSG.load(Ordering::Relaxed);
+    if tb_msg != 0 && msg == tb_msg {
+        if let Ok(mut st) = shared.try_borrow_mut() {
+            st.pending_actions.push(PendingUiAction::TaskbarRecreated);
+        }
+        return LRESULT(0);
     }
 
     DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -1508,6 +1903,18 @@ mod tests {
     }
 
     #[test]
+    fn choose_taskbar_rect_prefers_non_empty_window_rect_and_rejects_zeros() {
+        let empty = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        let valid_win = RECT { left: 0, top: 1704, right: 2880, bottom: 1800 };
+        let valid_dwm = RECT { left: 0, top: 1706, right: 2880, bottom: 1800 };
+
+        assert_eq!(choose_taskbar_rect(Some(empty), Some(empty)), None);
+        assert_eq!(choose_taskbar_rect(Some(empty), Some(valid_dwm)), Some(valid_dwm));
+        assert_eq!(choose_taskbar_rect(Some(valid_win), Some(valid_dwm)), Some(valid_win));
+        assert_eq!(choose_taskbar_rect(None, Some(empty)), None);
+    }
+
+    #[test]
     fn resolve_taskbar_top_handles_shown_sliding_and_hidden() {
         let m_top = 0;
         let m_bot = 1800;
@@ -1518,6 +1925,14 @@ mod tests {
         assert_eq!(
             resolve_taskbar_top_px(RECT { left: 0, top: 1752, right: 2880, bottom: 1848 }, true, m_top, m_bot),
             (1752, true)
+        );
+        assert_eq!(
+            resolve_taskbar_top_px(RECT { left: 0, top: 1680, right: 2880, bottom: 1764 }, true, m_top, m_bot),
+            (1680, true)
+        );
+        assert_eq!(
+            resolve_taskbar_top_px(RECT { left: 0, top: 0, right: 0, bottom: 0 }, true, m_top, m_bot),
+            (1800, false)
         );
         assert_eq!(
             resolve_taskbar_top_px(RECT { left: 0, top: 1798, right: 2880, bottom: 1894 }, true, m_top, m_bot),
@@ -1531,6 +1946,58 @@ mod tests {
             resolve_taskbar_top_px(RECT { left: 0, top: 1704, right: 2880, bottom: 1800 }, false, m_top, m_bot),
             (1800, false)
         );
+    }
+
+    #[test]
+    fn monitor_taskbar_top_px_prefers_shown_and_primary_slice() {
+        let mon = MonitorMetrics {
+            phys_left: 0,
+            phys_top: 0,
+            phys_width: 2880,
+            phys_height: 1800,
+            work_left: 0,
+            work_top: 0,
+            work_width: 2880,
+            work_height: 1800,
+            dpi: 192,
+            dpr: 2.0,
+            is_primary: true,
+        };
+        let hidden_secondary = TaskbarSlice {
+            hwnd: 100,
+            monitor_idx: 0,
+            top_px: 1800,
+            mon_bottom_px: 1800,
+            is_shown: false,
+            is_primary: false,
+            win_rect: (0, 1798, 2880, 1894),
+        };
+        let shown_primary = TaskbarSlice {
+            hwnd: 200,
+            monitor_idx: 0,
+            top_px: 1704,
+            mon_bottom_px: 1800,
+            is_shown: true,
+            is_primary: true,
+            win_rect: (0, 1704, 2880, 1800),
+        };
+        let hidden_primary = TaskbarSlice {
+            hwnd: 200,
+            monitor_idx: 0,
+            top_px: 1800,
+            mon_bottom_px: 1800,
+            is_shown: false,
+            is_primary: true,
+            win_rect: (0, 1798, 2880, 1894),
+        };
+
+        let (top, picked) = monitor_taskbar_top_px(&[hidden_secondary, shown_primary], 0, &mon);
+        assert_eq!(top, 1704);
+        assert_eq!(picked.map(|s| s.hwnd), Some(200));
+
+        let (top_h, picked_h) = monitor_taskbar_top_px(&[hidden_secondary, hidden_primary], 0, &mon);
+        assert_eq!(top_h, 1800);
+        assert_eq!(picked_h.map(|s| s.hwnd), Some(200));
     }
 
     #[test]
@@ -1562,5 +2029,73 @@ mod tests {
             y = step_smooth_y(y, 1242.0, 0.016);
         }
         assert_eq!(y, 1242.0);
+    }
+
+    #[test]
+    fn shell_flyout_exe_detection_matches_windows_shell_hosts() {
+        assert!(is_shell_taskbar_flyout_exe("startmenuexperiencehost.exe"));
+        assert!(is_shell_taskbar_flyout_exe("searchhost.exe"));
+        assert!(is_shell_taskbar_flyout_exe("searchapp.exe"));
+        assert!(is_shell_taskbar_flyout_exe("shellhost.exe"));
+        assert!(is_shell_taskbar_flyout_exe("shellexperiencehost.exe"));
+        assert!(!is_shell_taskbar_flyout_exe("explorer.exe"));
+        assert!(!is_shell_taskbar_flyout_exe("msedge.exe"));
+        assert!(!is_shell_taskbar_flyout_exe(""));
+    }
+
+    #[test]
+    fn merge_taskbar_hwnd_retains_existing_and_deduplicates() {
+        let h_primary = HWND(0x4013A_isize as *mut _);
+        let h_secondary = HWND(0x1C0B46_isize as *mut _);
+        let mut list = vec![(h_primary, true)];
+
+        merge_taskbar_hwnd(&mut list, HWND::default(), true);
+        assert_eq!(list, vec![(h_primary, true)]);
+
+        merge_taskbar_hwnd(&mut list, h_primary, false);
+        assert_eq!(list, vec![(h_primary, true)]);
+
+        merge_taskbar_hwnd(&mut list, h_secondary, false);
+        assert_eq!(list, vec![(h_primary, true), (h_secondary, false)]);
+
+        merge_taskbar_hwnd(&mut list, h_secondary, true);
+        assert_eq!(list, vec![(h_primary, true), (h_secondary, true)]);
+    }
+
+    #[test]
+    fn estimate_shown_taskbar_top_uses_priority_fallbacks() {
+        let hidden_rc = RECT {
+            left: 0,
+            top: 1798,
+            right: 2880,
+            bottom: 1894,
+        };
+        let empty_rc = RECT::default();
+
+        // Priority 1: last observed shown height
+        assert_eq!(
+            estimate_shown_taskbar_top_px(0, 1800, 2.0, Some(96), hidden_rc, Some(108)),
+            1704
+        );
+        // Priority 2: ABM_GETTASKBARPOS height when no prior shown sample exists
+        assert_eq!(
+            estimate_shown_taskbar_top_px(0, 1800, 2.0, None, hidden_rc, Some(104)),
+            1696
+        );
+        // Priority 3: raw hidden Shell_TrayWnd height (retains its 96 px taskbar thickness)
+        assert_eq!(
+            estimate_shown_taskbar_top_px(0, 1800, 1.0, None, hidden_rc, None),
+            1704
+        );
+        // Priority 4: 48 DIP * DPR fallback when nothing else is valid
+        assert_eq!(
+            estimate_shown_taskbar_top_px(0, 1800, 2.25, None, empty_rc, Some(8)),
+            1692
+        );
+        // Clamped within [mon_bottom - max_tb_h, mon_bottom]
+        assert_eq!(
+            estimate_shown_taskbar_top_px(0, 1800, 2.0, Some(900), empty_rc, None),
+            1704
+        );
     }
 }

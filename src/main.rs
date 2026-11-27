@@ -36,11 +36,11 @@ use crate::window::{
     compute_overlay_rect_px, create_pet_window, create_tray_host_window, destroy_all_windows,
     destroy_pet_window, enable_per_monitor_dpi_v2, ensure_and_position_overlay,
     ensure_pet_above_taskbar, enumerate_monitors, hide_overlay, initial_taskbar_offset_dip,
-    monitor_taskbar_top_px, move_pet_window_px, pet_core_bottom_px, pet_win_y_for_taskbar_px,
-    pick_monitor_for_phys_point, pick_monitor_idx_for_phys_point, register_window_class,
-    resize_pet_window_to_size, resolve_pet_dpr, set_pet_always_on_top, set_pet_window_visible,
-    step_smooth_y, sync_click_through, MonitorMetrics, PendingUiAction, SharedAppEvents,
-    TaskbarTracker,
+    is_window_above, monitor_taskbar_top_px, move_pet_window_px, pet_core_bottom_px,
+    pet_win_y_for_taskbar_px, pick_monitor_for_phys_point, pick_monitor_idx_for_phys_point,
+    register_window_class, resize_pet_window_to_size, resolve_pet_dpr, set_pet_always_on_top,
+    set_pet_window_visible, step_smooth_y, sync_click_through, MonitorMetrics, PendingUiAction,
+    SharedAppEvents, TaskbarTracker,
 };
 use chrono::Local;
 use serde_json::json;
@@ -73,6 +73,7 @@ struct CliArgs {
     persist: bool,
     read_only: bool,
     bcp_key: Option<String>,
+    debug_taskbar: bool,
 }
 
 fn parse_args() -> CliArgs {
@@ -85,6 +86,7 @@ fn parse_args() -> CliArgs {
         persist: false,
         read_only: false,
         bcp_key: None,
+        debug_taskbar: false,
     };
     while let Some(a) = args.next() {
         if a == "--data-dir" {
@@ -111,6 +113,8 @@ fn parse_args() -> CliArgs {
             out.read_only = true;
         } else if a == "--bcp-key" {
             out.bcp_key = args.next();
+        } else if a == "--debug-taskbar" {
+            out.debug_taskbar = true;
         }
     }
     out
@@ -659,8 +663,8 @@ fn snap_pets_to_taskbar(
         let px = pw.rect_px.0;
         move_pet_window_px(pw, px, target_y.round() as i32);
         if !pets_disabled {
-            if let Some(sl) = tb_slice.filter(|s| s.is_shown) {
-                ensure_pet_above_taskbar(pw, HWND(sl.hwnd as *mut _));
+            if let Some(sl) = tb_slice {
+                ensure_pet_above_taskbar(pw, HWND(sl.hwnd as *mut _), now, true);
             }
         }
     }
@@ -688,7 +692,7 @@ fn run() -> Result<(), String> {
     let source_state_path = data_dir.join("state.json");
     let (mut state, mut persister, from_sidecar) =
         load_synced_state(&source_state_path, persist_enabled, None)?;
-    let monitors = enumerate_monitors();
+    let mut monitors = enumerate_monitors();
     let gpu = GpuContext::new(cli.gpu_pref)?;
     let mut available_chars = list_available_characters(&data_dir);
 
@@ -697,7 +701,9 @@ fn run() -> Result<(), String> {
     let mut attach_to_taskbar = cli.smoke_ms.is_none() && persister.attach_to_taskbar();
     let mut taskbar_offsets = persister.taskbar_offsets();
     let mut taskbar_tracker = TaskbarTracker::new();
-    let mut last_tb_tops: Vec<i32> = Vec::new();
+    let mut last_tb_tops: Vec<(usize, i32, bool)> = Vec::new();
+    let mut prev_flyout_active = false;
+    let mut last_tb_debug: Option<Instant> = None;
     let mut launch_at_login = if persist_enabled {
         is_autostart_enabled()
     } else {
@@ -787,7 +793,7 @@ fn run() -> Result<(), String> {
         );
     }
 
-    let tray_icon = match TrayIcon::new(
+    let mut tray_icon = match TrayIcon::new(
         tray_hwnd,
         Some(&data_dir),
         shared.borrow().pets.len(),
@@ -965,8 +971,8 @@ fn run() -> Result<(), String> {
                                     };
                                     if attach_to_taskbar {
                                         let slices = taskbar_tracker.sample(&monitors, now);
-                                        let st = shared.borrow();
-                                        for pw in &st.pets {
+                                        let mut st = shared.borrow_mut();
+                                        for pw in &mut st.pets {
                                             let mon_idx = pick_monitor_idx_for_phys_point(
                                                 pw.rect_px.0 + pw.rect_px.2 / 2,
                                                 pw.rect_px.1 + pw.rect_px.3 / 2,
@@ -977,10 +983,12 @@ fn run() -> Result<(), String> {
                                                 mon_idx,
                                                 &monitors[mon_idx],
                                             );
-                                            if let Some(sl) = tb_slice.filter(|s| s.is_shown) {
+                                            if let Some(sl) = tb_slice {
                                                 ensure_pet_above_taskbar(
                                                     pw,
                                                     HWND(sl.hwnd as *mut _),
+                                                    now,
+                                                    true,
                                                 );
                                             }
                                         }
@@ -1040,10 +1048,12 @@ fn run() -> Result<(), String> {
                                                 .patch_taskbar_offset(&pw.runtime.id, offset_dip);
                                             pw.smooth_y_px = Some(pw.rect_px.1 as f64);
                                             if !pets_disabled {
-                                                if let Some(sl) = tb_slice.filter(|s| s.is_shown) {
+                                                if let Some(sl) = tb_slice {
                                                     ensure_pet_above_taskbar(
                                                         pw,
                                                         HWND(sl.hwnd as *mut _),
+                                                        now,
+                                                        true,
                                                     );
                                                 }
                                             }
@@ -1573,7 +1583,7 @@ fn run() -> Result<(), String> {
                                         pw.rect_px.1 + pw.rect_px.3 / 2,
                                         &monitors,
                                     );
-                                    let (tb_top_px, _) = monitor_taskbar_top_px(
+                                    let (tb_top_px, tb_slice) = monitor_taskbar_top_px(
                                         slices,
                                         mon_idx,
                                         &monitors[mon_idx],
@@ -1586,6 +1596,16 @@ fn run() -> Result<(), String> {
                                     );
                                     let off = (core_b - tb_top_px as f64) / pw.dpr.max(0.5);
                                     pw.smooth_y_px = Some(pw.rect_px.1 as f64);
+                                    if !pets_disabled {
+                                        if let Some(sl) = tb_slice {
+                                            ensure_pet_above_taskbar(
+                                                pw,
+                                                HWND(sl.hwnd as *mut _),
+                                                now,
+                                                true,
+                                            );
+                                        }
+                                    }
                                     Some(off)
                                 } else {
                                     None
@@ -1608,6 +1628,51 @@ fn run() -> Result<(), String> {
                             persister.patch_taskbar_offset(&pet_id, off);
                         }
                         persister.patch_pet_pos(&pet_id, ex, ey, anc);
+                    }
+                }
+                PendingUiAction::DisplayChanged => {
+                    let next_mons = enumerate_monitors();
+                    if !next_mons.is_empty() {
+                        monitors = next_mons;
+                    }
+                    taskbar_tracker.invalidate();
+                    last_tb_tops.clear();
+                    if attach_to_taskbar && !pets_disabled {
+                        snap_pets_to_taskbar(
+                            &monitors,
+                            &shared,
+                            &mut taskbar_tracker,
+                            &mut taskbar_offsets,
+                            &mut persister,
+                            pets_disabled,
+                            now,
+                        );
+                    }
+                }
+                PendingUiAction::TaskbarRecreated => {
+                    taskbar_tracker.invalidate();
+                    last_tb_tops.clear();
+                    tray_icon = None;
+                    let pet_count = shared.borrow().pets.len();
+                    if let Ok(ti) = TrayIcon::new(
+                        tray_hwnd,
+                        Some(&data_dir),
+                        pet_count,
+                        pets_disabled,
+                        &state.prefs.ui.lang,
+                    ) {
+                        tray_icon = Some(ti);
+                    }
+                    if attach_to_taskbar && !pets_disabled {
+                        snap_pets_to_taskbar(
+                            &monitors,
+                            &shared,
+                            &mut taskbar_tracker,
+                            &mut taskbar_offsets,
+                            &mut persister,
+                            pets_disabled,
+                            now,
+                        );
                     }
                 }
             }
@@ -1727,8 +1792,14 @@ fn run() -> Result<(), String> {
             } else {
                 Vec::new()
             };
+            let flyout_now = attach_to_taskbar && taskbar_tracker.shell_flyout_active();
+            let flyout_toggled = flyout_now != prev_flyout_active;
+            prev_flyout_active = flyout_now;
             let tb_moved = if attach_to_taskbar {
-                let cur_tops: Vec<i32> = tb_slices.iter().map(|s| s.top_px).collect();
+                let cur_tops: Vec<(usize, i32, bool)> = tb_slices
+                    .iter()
+                    .map(|s| (s.monitor_idx, s.top_px, s.is_shown))
+                    .collect();
                 let changed = cur_tops != last_tb_tops;
                 last_tb_tops = cur_tops;
                 changed
@@ -1803,10 +1874,10 @@ fn run() -> Result<(), String> {
             let stay_frozen_idle = currently_resting && was_resting;
             was_resting = currently_resting;
 
-            if stay_frozen_idle {
+            let frame_sleep = if stay_frozen_idle {
                 if attach_to_taskbar {
-                    let st = shared.borrow();
-                    for pw in &st.pets {
+                    let mut st = shared.borrow_mut();
+                    for pw in &mut st.pets {
                         let mon_idx = pick_monitor_idx_for_phys_point(
                             pw.rect_px.0 + pw.rect_px.2 / 2,
                             pw.rect_px.1 + pw.rect_px.3 / 2,
@@ -1814,8 +1885,13 @@ fn run() -> Result<(), String> {
                         );
                         let (_, tb_slice) =
                             monitor_taskbar_top_px(&tb_slices, mon_idx, &monitors[mon_idx]);
-                        if let Some(sl) = tb_slice.filter(|s| s.is_shown) {
-                            ensure_pet_above_taskbar(pw, HWND(sl.hwnd as *mut _));
+                        if let Some(sl) = tb_slice {
+                            ensure_pet_above_taskbar(
+                                pw,
+                                HWND(sl.hwnd as *mut _),
+                                now,
+                                flyout_toggled,
+                            );
                         }
                     }
                 }
@@ -1851,7 +1927,7 @@ fn run() -> Result<(), String> {
                                 mon_idx,
                                 &monitors[mon_idx],
                             );
-                            if let Some(sl) = tb_slice.filter(|s| s.is_shown) {
+                            if let Some(sl) = tb_slice {
                                 tb_hwnd_for_pet = HWND(sl.hwnd as *mut _);
                             }
                             if Some(pw.hwnd.0 as isize) != dragging_hwnd {
@@ -1941,9 +2017,14 @@ fn run() -> Result<(), String> {
                     }
                     st.overlay_map = ov_map;
                     if attach_to_taskbar {
-                        for (pw, tb_hwnd) in st.pets.iter().zip(z_checks.into_iter()) {
+                        for (pw, tb_hwnd) in st.pets.iter_mut().zip(z_checks.into_iter()) {
                             if !tb_hwnd.0.is_null() {
-                                ensure_pet_above_taskbar(pw, tb_hwnd);
+                                ensure_pet_above_taskbar(
+                                    pw,
+                                    tb_hwnd,
+                                    now,
+                                    tb_moved || flyout_toggled,
+                                );
                             }
                         }
                     }
@@ -1963,7 +2044,55 @@ fn run() -> Result<(), String> {
                     next_frame += target_frame_dt;
                 }
                 next_frame.saturating_duration_since(now_after)
+            };
+
+            if cli.debug_taskbar && attach_to_taskbar {
+                let due = last_tb_debug
+                    .is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_secs(2));
+                if tb_moved || due {
+                    last_tb_debug = Some(now);
+                    let slices_desc: Vec<String> = tb_slices
+                        .iter()
+                        .map(|s| {
+                            format!(
+                                "m{}[{},top={},shown={},pri={},rc={:?}]",
+                                s.monitor_idx, s.hwnd, s.top_px, s.is_shown, s.is_primary, s.win_rect
+                            )
+                        })
+                        .collect();
+                    let st = shared.borrow();
+                    let pets_desc: Vec<String> = st
+                        .pets
+                        .iter()
+                        .map(|pw| {
+                            let mon_idx = pick_monitor_idx_for_phys_point(
+                                pw.rect_px.0 + pw.rect_px.2 / 2,
+                                pw.rect_px.1 + pw.rect_px.3 / 2,
+                                &monitors,
+                            );
+                            let (tb_top, tb_sl) =
+                                monitor_taskbar_top_px(&tb_slices, mon_idx, &monitors[mon_idx]);
+                            let off = taskbar_offsets.get(&pw.runtime.id).copied().unwrap_or(0.0);
+                            let below = tb_sl
+                                .is_some_and(|sl| is_window_above(HWND(sl.hwnd as *mut _), pw.hwnd));
+                            format!(
+                                "{}(m{},y={},tb={},off={:.1},below={})",
+                                pw.runtime.id, mon_idx, pw.rect_px.1, tb_top, off, below
+                            )
+                        })
+                        .collect();
+                    println!(
+                        "[bug-pet-rs][tb-debug] moved={} launcher={} flyout={} slices=[{}] pets=[{}]",
+                        tb_moved,
+                        taskbar_tracker.launcher_visible(),
+                        taskbar_tracker.shell_flyout_active(),
+                        slices_desc.join(" "),
+                        pets_desc.join(" ")
+                    );
+                }
             }
+
+            frame_sleep
         };
 
         if let Some(th) = wait_timer {
